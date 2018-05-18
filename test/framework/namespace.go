@@ -19,9 +19,9 @@ import (
 	"testing"
 
 	"github.com/pkg/errors"
+	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/pkg/api/v1"
 )
 
 func CreateNamespace(kubeClient kubernetes.Interface, name string) (*v1.Namespace, error) {
@@ -56,4 +56,26 @@ func (ctx *TestCtx) CreateNamespace(t *testing.T, kubeClient kubernetes.Interfac
 
 func DeleteNamespace(kubeClient kubernetes.Interface, name string) error {
 	return kubeClient.Core().Namespaces().Delete(name, nil)
+}
+
+func AddLabelsToNamespace(kubeClient kubernetes.Interface, name string, additionalLabels map[string]string) error {
+	ns, err := kubeClient.CoreV1().Namespaces().Get(name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+
+	if ns.Labels == nil {
+		ns.Labels = map[string]string{}
+	}
+
+	for k, v := range additionalLabels {
+		ns.Labels[k] = v
+	}
+
+	_, err = kubeClient.CoreV1().Namespaces().Update(ns)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }

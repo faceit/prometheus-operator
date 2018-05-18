@@ -22,7 +22,7 @@ import (
 
 	"github.com/blang/semver"
 	"github.com/pkg/errors"
-	yaml "gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/coreos/prometheus-operator/pkg/client/monitoring/v1"
@@ -37,20 +37,60 @@ func sanitizeLabelName(name string) string {
 }
 
 func configMapRuleFileFolder(configMapNumber int) string {
-	return fmt.Sprintf("/etc/prometheus/rules/rules-%d/", configMapNumber)
+	return fmt.Sprintf("/etc/prometheus/config_out/rules/rules-%d/", configMapNumber)
 }
 
 func stringMapToMapSlice(m map[string]string) yaml.MapSlice {
 	res := yaml.MapSlice{}
+	ks := make([]string, 0)
 
-	for k, v := range m {
-		res = append(res, yaml.MapItem{Key: k, Value: v})
+	for k, _ := range m {
+		ks = append(ks, k)
+	}
+	sort.Strings(ks)
+
+	for _, k := range ks {
+		res = append(res, yaml.MapItem{Key: k, Value: m[k]})
 	}
 
 	return res
 }
 
-func generateConfig(p *v1.Prometheus, mons map[string]*v1.ServiceMonitor, ruleConfigMaps int, basicAuthSecrets map[string]BasicAuthCredentials) ([]byte, error) {
+func addTLStoYaml(cfg yaml.MapSlice, tls *v1.TLSConfig) yaml.MapSlice {
+	if tls != nil {
+		tlsConfig := yaml.MapSlice{
+			{Key: "insecure_skip_verify", Value: tls.InsecureSkipVerify},
+		}
+		if tls.CAFile != "" {
+			tlsConfig = append(tlsConfig, yaml.MapItem{Key: "ca_file", Value: tls.CAFile})
+		}
+		if tls.CertFile != "" {
+			tlsConfig = append(tlsConfig, yaml.MapItem{Key: "cert_file", Value: tls.CertFile})
+		}
+		if tls.KeyFile != "" {
+			tlsConfig = append(tlsConfig, yaml.MapItem{Key: "key_file", Value: tls.KeyFile})
+		}
+		if tls.ServerName != "" {
+			tlsConfig = append(tlsConfig, yaml.MapItem{Key: "server_name", Value: tls.ServerName})
+		}
+		cfg = append(cfg, yaml.MapItem{Key: "tls_config", Value: tlsConfig})
+	}
+	return cfg
+}
+
+func buildExternalLabels(p *v1.Prometheus) yaml.MapSlice {
+	m := map[string]string{}
+
+	m["prometheus"] = fmt.Sprintf("%s/%s", p.Namespace, p.Name)
+	m["prometheus_replica"] = "$(POD_NAME)"
+
+	for n, v := range p.Spec.ExternalLabels {
+		m[n] = v
+	}
+	return stringMapToMapSlice(m)
+}
+
+func generateConfig(p *v1.Prometheus, mons map[string]*v1.ServiceMonitor, ruleConfigMaps int, basicAuthSecrets map[string]BasicAuthCredentials, additionalScrapeConfigs []byte, additionalAlertManagerConfigs []byte) ([]byte, error) {
 	versionStr := p.Spec.Version
 	if versionStr == "" {
 		versionStr = DefaultVersion
@@ -78,14 +118,14 @@ func generateConfig(p *v1.Prometheus, mons map[string]*v1.ServiceMonitor, ruleCo
 		Value: yaml.MapSlice{
 			{Key: "evaluation_interval", Value: evaluationInterval},
 			{Key: "scrape_interval", Value: scrapeInterval},
-			{Key: "external_labels", Value: stringMapToMapSlice(p.Spec.ExternalLabels)},
+			{Key: "external_labels", Value: buildExternalLabels(p)},
 		},
 	})
 
 	if ruleConfigMaps > 0 {
 		configMaps := make([]string, ruleConfigMaps)
 		for i := 0; i < ruleConfigMaps; i++ {
-			configMaps[i] = configMapRuleFileFolder(i) + "*.rules"
+			configMaps[i] = configMapRuleFileFolder(i) + "*"
 		}
 		cfg = append(cfg, yaml.MapItem{
 			Key:   "rule_files",
@@ -110,24 +150,63 @@ func generateConfig(p *v1.Prometheus, mons map[string]*v1.ServiceMonitor, ruleCo
 		}
 	}
 	var alertmanagerConfigs []yaml.MapSlice
-	for _, am := range p.Spec.Alerting.Alertmanagers {
-		alertmanagerConfigs = append(alertmanagerConfigs, generateAlertmanagerConfig(version, am))
+	if p.Spec.Alerting != nil {
+		for _, am := range p.Spec.Alerting.Alertmanagers {
+			alertmanagerConfigs = append(alertmanagerConfigs, generateAlertmanagerConfig(version, am))
+		}
+	}
+
+	var additionalScrapeConfigsYaml []yaml.MapSlice
+	err = yaml.Unmarshal([]byte(additionalScrapeConfigs), &additionalScrapeConfigsYaml)
+	if err != nil {
+		errors.Wrap(err, "unmarshalling additional scrape configs failed")
 	}
 
 	cfg = append(cfg, yaml.MapItem{
 		Key:   "scrape_configs",
-		Value: scrapeConfigs,
+		Value: append(scrapeConfigs, additionalScrapeConfigsYaml...),
 	})
+
+	var additionalAlertManagerConfigsYaml []yaml.MapSlice
+	err = yaml.Unmarshal([]byte(additionalAlertManagerConfigs), &additionalAlertManagerConfigsYaml)
+	if err != nil {
+		errors.Wrap(err, "unmarshalling additional alert manager configs failed")
+	}
+
+	alertmanagerConfigs = append(alertmanagerConfigs, additionalAlertManagerConfigsYaml...)
+
+	var alertRelabelConfigs []yaml.MapSlice
+
+	// action 'labeldrop' is not supported <= v1.4.1
+	if version.GT(semver.MustParse("1.4.1")) {
+		// Drop 'prometheus_replica' label, to make alerts from two Prometheus replicas alike
+		alertRelabelConfigs = append(alertRelabelConfigs, yaml.MapSlice{
+			{Key: "action", Value: "labeldrop"},
+			{Key: "regex", Value: "prometheus_replica"},
+		})
+	}
 
 	cfg = append(cfg, yaml.MapItem{
 		Key: "alerting",
 		Value: yaml.MapSlice{
+			{
+				Key:   "alert_relabel_configs",
+				Value: alertRelabelConfigs,
+			},
 			{
 				Key:   "alertmanagers",
 				Value: alertmanagerConfigs,
 			},
 		},
 	})
+
+	if len(p.Spec.RemoteWrite) > 0 && version.Major >= 2 {
+		cfg = append(cfg, generateRemoteWriteConfig(version, p.Spec.RemoteWrite, basicAuthSecrets))
+	}
+
+	if len(p.Spec.RemoteRead) > 0 && version.Major >= 2 {
+		cfg = append(cfg, generateRemoteReadConfig(version, p.Spec.RemoteRead, basicAuthSecrets))
+	}
 
 	return yaml.Marshal(cfg)
 }
@@ -170,30 +249,15 @@ func generateServiceMonitorConfig(version semver.Version, m *v1.ServiceMonitor, 
 	if ep.Scheme != "" {
 		cfg = append(cfg, yaml.MapItem{Key: "scheme", Value: ep.Scheme})
 	}
-	if ep.TLSConfig != nil {
-		tlsConfig := yaml.MapSlice{
-			{Key: "insecure_skip_verify", Value: ep.TLSConfig.InsecureSkipVerify},
-		}
-		if ep.TLSConfig.CAFile != "" {
-			tlsConfig = append(tlsConfig, yaml.MapItem{Key: "ca_file", Value: ep.TLSConfig.CAFile})
-		}
-		if ep.TLSConfig.CertFile != "" {
-			tlsConfig = append(tlsConfig, yaml.MapItem{Key: "cert_file", Value: ep.TLSConfig.CertFile})
-		}
-		if ep.TLSConfig.KeyFile != "" {
-			tlsConfig = append(tlsConfig, yaml.MapItem{Key: "key_file", Value: ep.TLSConfig.KeyFile})
-		}
-		if ep.TLSConfig.ServerName != "" {
-			tlsConfig = append(tlsConfig, yaml.MapItem{Key: "server_name", Value: ep.TLSConfig.ServerName})
-		}
-		cfg = append(cfg, yaml.MapItem{Key: "tls_config", Value: tlsConfig})
-	}
+
+	cfg = addTLStoYaml(cfg, ep.TLSConfig)
+
 	if ep.BearerTokenFile != "" {
 		cfg = append(cfg, yaml.MapItem{Key: "bearer_token_file", Value: ep.BearerTokenFile})
 	}
 
 	if ep.BasicAuth != nil {
-		if s, ok := basicAuthSecrets[fmt.Sprintf("%s/%s/%d", m.Namespace, m.Name, i)]; ok {
+		if s, ok := basicAuthSecrets[fmt.Sprintf("serviceMonitor/%s/%s/%d", m.Namespace, m.Name, i)]; ok {
 			cfg = append(cfg, yaml.MapItem{
 				Key: "basic_auth", Value: yaml.MapSlice{
 					{Key: "username", Value: s.username},
@@ -208,20 +272,17 @@ func generateServiceMonitorConfig(version semver.Version, m *v1.ServiceMonitor, 
 	// Filter targets by services selected by the monitor.
 
 	// Exact label matches.
-	labelKeys := make([]string, len(m.Spec.Selector.MatchLabels))
-	i = 0
-	for k, _ := range m.Spec.Selector.MatchLabels {
-		labelKeys[i] = k
-		i++
+	var labelKeys []string
+	for k := range m.Spec.Selector.MatchLabels {
+		labelKeys = append(labelKeys, k)
 	}
 	sort.Strings(labelKeys)
-	for i := range labelKeys {
-		k := labelKeys[i]
-		v := m.Spec.Selector.MatchLabels[k]
+
+	for _, k := range labelKeys {
 		relabelings = append(relabelings, yaml.MapSlice{
 			{Key: "action", Value: "keep"},
 			{Key: "source_labels", Value: []string{"__meta_kubernetes_service_label_" + sanitizeLabelName(k)}},
-			{Key: "regex", Value: v},
+			{Key: "regex", Value: m.Spec.Selector.MatchLabels[k]},
 		})
 	}
 	// Set based label matching. We have to map the valid relations
@@ -322,6 +383,16 @@ func generateServiceMonitorConfig(version semver.Version, m *v1.ServiceMonitor, 
 		},
 	}...)
 
+	// Relabel targetLabels from Service onto target.
+	for _, l := range m.Spec.TargetLabels {
+		relabelings = append(relabelings, yaml.MapSlice{
+			{Key: "source_labels", Value: []string{"__meta_kubernetes_service_label_" + sanitizeLabelName(l)}},
+			{Key: "target_label", Value: sanitizeLabelName(l)},
+			{Key: "regex", Value: "(.+)"},
+			{Key: "replacement", Value: "${1}"},
+		})
+	}
+
 	// By default, generate a safe job name from the service name.  We also keep
 	// this around if a jobLabel is set in case the targets don't actually have a
 	// value for it. A single service may potentially have multiple metrics
@@ -355,6 +426,44 @@ func generateServiceMonitorConfig(version semver.Version, m *v1.ServiceMonitor, 
 	}
 
 	cfg = append(cfg, yaml.MapItem{Key: "relabel_configs", Value: relabelings})
+
+	if ep.MetricRelabelConfigs != nil {
+		var metricRelabelings []yaml.MapSlice
+		for _, c := range ep.MetricRelabelConfigs {
+			relabeling := yaml.MapSlice{}
+
+			if len(c.SourceLabels) > 0 {
+				relabeling = append(relabeling, yaml.MapItem{Key: "source_labels", Value: c.SourceLabels})
+			}
+
+			if c.Separator != "" {
+				relabeling = append(relabeling, yaml.MapItem{Key: "separator", Value: c.Separator})
+			}
+
+			if c.TargetLabel != "" {
+				relabeling = append(relabeling, yaml.MapItem{Key: "target_label", Value: c.TargetLabel})
+			}
+
+			if c.Regex != "" {
+				relabeling = append(relabeling, yaml.MapItem{Key: "regex", Value: c.Regex})
+			}
+
+			if c.Modulus != uint64(0) {
+				relabeling = append(relabeling, yaml.MapItem{Key: "modulus", Value: c.Modulus})
+			}
+
+			if c.Replacement != "" {
+				relabeling = append(relabeling, yaml.MapItem{Key: "replacement", Value: c.Replacement})
+			}
+
+			if c.Action != "" {
+				relabeling = append(relabeling, yaml.MapItem{Key: "action", Value: c.Action})
+			}
+
+			metricRelabelings = append(metricRelabelings, relabeling)
+		}
+		cfg = append(cfg, yaml.MapItem{Key: "metric_relabel_configs", Value: metricRelabelings})
+	}
 
 	return cfg
 }
@@ -425,6 +534,8 @@ func generateAlertmanagerConfig(version semver.Version, am v1.AlertmanagerEndpoi
 		{Key: "scheme", Value: am.Scheme},
 	}
 
+	cfg = addTLStoYaml(cfg, am.TLSConfig)
+
 	switch version.Major {
 	case 1:
 		if version.Minor < 7 {
@@ -434,6 +545,10 @@ func generateAlertmanagerConfig(version semver.Version, am v1.AlertmanagerEndpoi
 		}
 	case 2:
 		cfg = append(cfg, k8sSDWithNamespaces([]string{am.Namespace}))
+	}
+
+	if am.BearerTokenFile != "" {
+		cfg = append(cfg, yaml.MapItem{Key: "bearer_token_file", Value: am.BearerTokenFile})
 	}
 
 	var relabelings []yaml.MapSlice
@@ -469,4 +584,144 @@ func generateAlertmanagerConfig(version semver.Version, am v1.AlertmanagerEndpoi
 	cfg = append(cfg, yaml.MapItem{Key: "relabel_configs", Value: relabelings})
 
 	return cfg
+}
+
+func generateRemoteReadConfig(version semver.Version, specs []v1.RemoteReadSpec, basicAuthSecrets map[string]BasicAuthCredentials) yaml.MapItem {
+
+	cfgs := []yaml.MapSlice{}
+
+	for i, spec := range specs {
+		//defaults
+		if spec.RemoteTimeout == "" {
+			spec.RemoteTimeout = "30s"
+		}
+
+		cfg := yaml.MapSlice{
+			{Key: "url", Value: spec.URL},
+			{Key: "remote_timeout", Value: spec.RemoteTimeout},
+		}
+
+		if len(spec.RequiredMatchers) > 0 {
+			cfg = append(cfg, yaml.MapItem{Key: "required_matchers", Value: stringMapToMapSlice(spec.RequiredMatchers)})
+		}
+
+		if spec.ReadRecent {
+			cfg = append(cfg, yaml.MapItem{Key: "read_recent", Value: spec.ReadRecent})
+		}
+
+		if spec.BasicAuth != nil {
+			if s, ok := basicAuthSecrets[fmt.Sprintf("remoteRead/%d", i)]; ok {
+				cfg = append(cfg, yaml.MapItem{
+					Key: "basic_auth", Value: yaml.MapSlice{
+						{Key: "username", Value: s.username},
+						{Key: "password", Value: s.password},
+					},
+				})
+			}
+		}
+
+		if spec.BearerTokenFile != "" {
+			cfg = append(cfg, yaml.MapItem{Key: "bearer_token_file", Value: spec.BearerTokenFile})
+		}
+
+		cfg = addTLStoYaml(cfg, spec.TLSConfig)
+
+		if spec.ProxyURL != "" {
+			cfg = append(cfg, yaml.MapItem{Key: "proxy_url", Value: spec.ProxyURL})
+		}
+
+		cfgs = append(cfgs, cfg)
+
+	}
+
+	return yaml.MapItem{
+		Key:   "remote_read",
+		Value: cfgs,
+	}
+}
+
+func generateRemoteWriteConfig(version semver.Version, specs []v1.RemoteWriteSpec, basicAuthSecrets map[string]BasicAuthCredentials) yaml.MapItem {
+
+	cfgs := []yaml.MapSlice{}
+
+	for i, spec := range specs {
+		//defaults
+		if spec.RemoteTimeout == "" {
+			spec.RemoteTimeout = "30s"
+		}
+
+		cfg := yaml.MapSlice{
+			{Key: "url", Value: spec.URL},
+			{Key: "remote_timeout", Value: spec.RemoteTimeout},
+		}
+
+		if spec.WriteRelabelConfigs != nil {
+			relabelings := []yaml.MapSlice{}
+			for _, c := range spec.WriteRelabelConfigs {
+				relabeling := yaml.MapSlice{
+					{Key: "source_labels", Value: c.SourceLabels},
+				}
+
+				if c.Separator != "" {
+					relabeling = append(relabeling, yaml.MapItem{Key: "separator", Value: c.Separator})
+				}
+
+				if c.TargetLabel != "" {
+					relabeling = append(relabeling, yaml.MapItem{Key: "target_label", Value: c.TargetLabel})
+				}
+
+				if c.Regex != "" {
+					relabeling = append(relabeling, yaml.MapItem{Key: "regex", Value: c.Regex})
+				}
+
+				if c.Modulus != uint64(0) {
+					relabeling = append(relabeling, yaml.MapItem{Key: "modulus", Value: c.Modulus})
+				}
+
+				if c.Replacement != "" {
+					relabeling = append(relabeling, yaml.MapItem{Key: "replacement", Value: c.Replacement})
+				}
+
+				if c.Action != "" {
+					relabeling = append(relabeling, yaml.MapItem{Key: "action", Value: c.Action})
+				}
+				relabelings = append(relabelings, relabeling)
+			}
+
+			cfg = append(cfg, yaml.MapItem{Key: "write_relabel_configs", Value: relabelings})
+
+		}
+
+		if spec.BasicAuth != nil {
+			if s, ok := basicAuthSecrets[fmt.Sprintf("remoteWrite/%d", i)]; ok {
+				cfg = append(cfg, yaml.MapItem{
+					Key: "basic_auth", Value: yaml.MapSlice{
+						{Key: "username", Value: s.username},
+						{Key: "password", Value: s.password},
+					},
+				})
+			}
+		}
+
+		if spec.BearerToken != "" {
+			cfg = append(cfg, yaml.MapItem{Key: "bearer_token", Value: spec.BearerToken})
+		}
+
+		if spec.BearerTokenFile != "" {
+			cfg = append(cfg, yaml.MapItem{Key: "bearer_token_file", Value: spec.BearerTokenFile})
+		}
+
+		cfg = addTLStoYaml(cfg, spec.TLSConfig)
+
+		if spec.ProxyURL != "" {
+			cfg = append(cfg, yaml.MapItem{Key: "proxy_url", Value: spec.ProxyURL})
+		}
+
+		cfgs = append(cfgs, cfg)
+	}
+
+	return yaml.MapItem{
+		Key:   "remote_write",
+		Value: cfgs,
+	}
 }

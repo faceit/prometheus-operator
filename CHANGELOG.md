@@ -1,3 +1,90 @@
+## 0.19.0 / 2018-04-25
+
+* [FEATURE] Allow specifying additional Prometheus scrape configs via secret (#1246)
+* [FEATURE] Enable Thanos sidecar (#1219)
+* [FEATURE] Make AM log level configurable (#1192)
+* [ENHANCEMENT] Enable Prometheus to select Service Monitors outside own namespace (#1227)
+* [ENHANCEMENT] Enrich Prometheus operator CRD registration error handling (#1208)
+* [BUGFIX] Allow up to 10m for Prometheus pod on startup for data recovery (#1232)
+
+## 0.18.1 / 2018-04-09
+
+* [BUGFIX] Fix alertmanager >=0.15.0 cluster gossip communication (#1193)
+
+## 0.18.0 / 2018-03-04
+
+From this release onwards only Kubernetes versions v1.8 and higher are supported. If you have an older version of Kubernetes and the Prometheus Operator running, we recommend upgrading Kubernetes first and then the Prometheus Operator.
+
+While multiple validation issues have been fixed, it will remain a beta feature in this release. If you want to update validations, you need to either apply the CustomResourceDefinitions located in `example/prometheus-operator-crd` or delete all CRDs and restart the Prometheus Operator.
+
+Some changes cause Prometheus and Alertmanager clusters to be redeployed. If you do not have persistent storage backing your data, this means you will loose the amount of data equal to your retention time.
+
+* [CHANGE] Use canonical `/prometheus` and `/alertmanager` as data dirs in containers.
+* [FEATURE] Allow configuring Prometheus and Alertmanager servers to listen on loopback interface, allowing proxies to be the ingress point of those Pods.
+* [FEATURE] Allow configuring additional containers in Prometheus and Alertmanager Pods.
+* [FEATURE] Add ability to whitelist Kubernetes labels to become Prometheus labels.
+* [FEATURE] Allow specifying additonal secrets for Alertmanager Pods to mount.
+* [FEATURE] Allow specifying `bearer_token_file` for Alertmanger configurations of Prometheus objects in order to authenticate with Alertmanager.
+* [FEATURE] Allow specifying TLS configuration for Alertmanger configurations of Prometheus objects.
+* [FEATURE] Add metrics for reconciliation errors: `prometheus_operator_alertmanager_reconcile_errors_total` and `prometheus_operator_prometheus_reconcile_errors_total`.
+* [FEATURE] Support `read_recent` and `required_matchers` fields for remote read configurations.
+* [FEATURE] Allow disabling any defaults of `SecurityContext` fields of Pods.
+* [BUGFIX] Handle Alertmanager >=v0.15.0 breaking changes correctly.
+* [BUGFIX] Fix invalid validations for metric relabeling fields.
+* [BUGFIX] Fix validations for `AlertingSpec`.
+* [BUGFIX] Fix validations for deprecated storage fields.
+* [BUGFIX] Fix remote read and write basic auth support.
+* [BUGFIX] Fix properly propagate errors of Prometheus config reloader.
+
+## 0.17.0 / 2018-02-15
+
+This release adds validations as a beta feature. It will only be installed on new clusters, existing CRD definitions will not be updated, this will be done in a future release. Please try out this feature and give us feedback!
+
+* [CHANGE] Default Prometheus version v2.2.0-rc.0.
+* [CHANGE] Default Alertmanager version v0.14.0.
+* [FEATURE] Generate and add CRD validations.
+* [FEATURE] Add ability to set `serviceAccountName` for Alertmanager Pods.
+* [FEATURE] Add ability to specify custom `securityContext` for Alertmanager Pods.
+* [ENHANCEMENT] Default to non-root security context for Alertmanager Pods.
+
+## 0.16.1 / 2018-01-16
+
+* [CHANGE] Default to Alertmanager v0.13.0.
+* [BUGFIX] Alertmanager flags must be double dashed starting v0.13.0.
+
+## 0.16.0 / 2018-01-11
+
+* [FEATURE] Add support for specifying remote storage configurations.
+* [FEATURE] Add ability to specify log level.
+* [FEATURE] Add support for dropping metrics at scrape time.
+* [ENHANCEMENT] Ensure that resource limit can't make Pods unschedulable.
+* [ENHANCEMENT] Allow configuring emtpyDir volumess
+* [BUGFIX] Use `--storage.tsdb.no-lockfile` for Prometheus 2.0.
+* [BUGFIX] Fix Alertmanager default storage.path.
+
+## 0.15.0 / 2017-11-22
+
+* [CHANGE] Default Prometheus version v2.0.0
+* [BUGFIX] Generate ExternalLabels deterministically
+* [BUGFIX] Fix incorrect mount path of Alertmanager data volume
+* [EXPERIMENTAL] Add ability to specify CRD Kind name
+
+## 0.14.1 / 2017-11-01
+
+* [BUGFIX] Ignore illegal change of PodManagementPolicy to StatefulSet.
+
+## 0.14.0 / 2017-10-19
+
+* [CHANGE] Default Prometheus version v2.0.0-rc.1.
+* [CHANGE] Default Alertmanager version v0.9.1.
+* [BUGFIX] Set StatefulSet replicas to 0 if 0 is specified in Alertmanager/Prometheus object.
+* [BUGFIX] Glob for all files in a ConfigMap as rule files.
+* [FEATURE] Add ability to run Prometheus Operator for a single namespace.
+* [FEATURE] Add ability to specify CRD api group.
+* [FEATURE] Use readiness and health endpoints of Prometheus 1.8+.
+* [ENHANCEMENT] Add OwnerReferences to managed objects.
+* [ENHANCEMENT] Use parallel pod creation strategy for Prometheus StatefulSets.
+
 ## 0.13.0 / 2017-09-21
 
 After a long period of not having broken any functionality in the Prometheus Operator, we have decided to promote the status of this project to beta.
@@ -191,4 +278,3 @@ with the operator.
 
 * [CHANGE] Use StatefulSet instead of PetSet
 * [BUGFIX] Fix Prometheus config generation for labels containing "-"
-

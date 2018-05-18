@@ -20,6 +20,8 @@ rules:
   resources:
   - alertmanagers
   - prometheuses
+  - prometheuses/finalizers
+  - alertmanagers/finalizers
   - servicemonitors
   verbs:
   - "*"
@@ -45,8 +47,5 @@ rules:
 - apiGroups: [""]
   resources:
   - nodes
-  verbs: ["list", "watch"]
-- apiGroups: [""]
-  resources:
   - namespaces
-  verbs: ["list"]
+  verbs: ["list", "watch"]

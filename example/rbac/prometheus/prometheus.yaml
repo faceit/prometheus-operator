@@ -6,7 +6,6 @@ metadata:
     prometheus: prometheus
 spec:
   replicas: 2
-  version: v1.5.2
   serviceAccountName: prometheus
   serviceMonitorSelector:
     matchLabels:
@@ -16,6 +15,3 @@ spec:
     - namespace: default
       name: alertmanager
       port: web
-  resources:
-    requests:
-      memory: 400Mi

@@ -23,11 +23,30 @@ externalLabels: {}
 ##
 externalUrl: ""
 
+## If true, create a serviceMonitor for prometheus
+##
+selfServiceMonitor: true
+
+## Change "prometheus" label value on all resources, .Release.Name by default
+##
+prometheusLabelValue: ""
+
+## Custom Labels to be added to ServiceMonitor
+##
+additionalSelfServiceMonitorLabels: {}
+##Custom Labels to be added to Prometheus Rules ConfigMap
+##
+additionalRulesConfigMapLabels: {}
+
 ## Prometheus container image
 ##
 image:
   repository: quay.io/prometheus/prometheus
-  tag: v1.7.1
+  tag: v2.2.1
+
+## Labels to be added to the Prometheus
+##
+labels: {}
 
 ingress:
   ## If true, Prometheus Ingress will be created
@@ -40,7 +59,16 @@ ingress:
     # kubernetes.io/ingress.class: nginx
     # kubernetes.io/tls-acme: "true"
 
-  fqdn: ""
+  ## Labels to be added to the Ingress
+  ##
+  labels: {}
+
+  ## Hostnames.
+  ## Must be provided if Ingress is enabled.
+  ##
+  # hosts:
+  #   - prometheus.domain.com
+  hosts: []
 
   ## TLS configuration for Prometheus Ingress
   ## Secret must be manually created in the namespace
@@ -55,17 +83,57 @@ ingress:
 ##
 nodeSelector: {}
 
+## Tolerations for use with node taints
+## Ref: https://kubernetes.io/docs/concepts/configuration/taint-and-toleration/
+##
+tolerations: {}
+  #  - key: "key"
+  #    operator: "Equal"
+  #    value: "value"
+  #    effect: "NoSchedule"
+
+
 ## If true, the Operator won't process any Prometheus configuration changes
 ##
 paused: false
 
-## If true, create & use RBAC resources
+## If true, create & use RBAC resources resp. Pod Security Policies
 ##
-rbacEnable: true
+global:
+  rbacEnable: true
+  pspEnable: true
+
+## serviceAccount to use by Prometheus
+##
+serviceAccount:
+  create: true
+  name: ""
 
 ## Number of Prometheus replicas desired
 ##
 replicaCount: 1
+
+## Log level for Prometheus be configured in
+##
+logLevel: info
+
+## Pod anti-affinity can prevent the scheduler from placing Prometheus replicas on the same node.
+## The default value "soft" means that the scheduler should *prefer* to not schedule two replica pods onto the same node but no guarantee is provided.
+## The value "hard" means that the scheduler is *required* to not schedule two replica pods onto the same node.
+## The value "" will disable pod anti-affinity so that no anti-affinity rules will be configured.
+podAntiAffinity: "soft"
+
+## The remote_read spec configuration for Prometheus.
+## Ref: https://github.com/coreos/prometheus-operator/blob/master/Documentation/api.md#remotereadspec
+remoteRead: {}
+  # remoteRead:
+  #   - url: http://remote1/read
+
+## The remote_write spec configuriation for Prometheus.
+## Ref: https://github.com/coreos/prometheus-operator/blob/master/Documentation/api.md#remotewritespec
+remoteWrite: {}
+  # remoteWrite:
+  #   - url: http://remote1/push
 
 ## Resource limits & requests
 ## Ref: https://kubernetes.io/docs/user-guide/compute-resources/
@@ -86,7 +154,19 @@ routePrefix: /
 ## Rules configmap selector
 ## Ref: https://github.com/coreos/prometheus-operator/blob/master/Documentation/design.md
 ##
+## 1. If `matchLabels` is used, `rules.additionalLabels` must contain all the labels from
+##    `matchLabels` in order to be be matched by Prometheus
+## 2. If `matchExpressions` is used `rules.additionalLabels` must contain at least one label
+##    from `matchExpressions` in order to be matched by Prometheus
+## Ref: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels
 rulesSelector: {}
+ # rulesSelector: {
+ #   matchExpressions: [{key: prometheus, operator: In, values: [example-rules, example-rules-2]}]
+ # }
+ ### OR
+ # rulesSelector: {
+ #   matchLabels: [{role: example-rules}]
+ # }
 
 ## Prometheus alerting & recording rules
 ## Ref: https://prometheus.io/docs/querying/rules/
@@ -94,15 +174,23 @@ rulesSelector: {}
 ##
 rules:
   specifiedInValues: true
+  ## What additional rules to be added to the ConfigMap
+  ## You can use this together with `rulesSelector`
+  additionalLabels: {}
+  #  prometheus: example-rules
+  #  application: etcd
   value: {}
 
 ## List of Secrets in the same namespace as the Prometheus
 ## object, which shall be mounted into the Prometheus Pods.
 ## Ref: https://github.com/coreos/prometheus-operator/blob/master/Documentation/api.md#prometheusspec
 ##
-secrets: {}
+secrets: []
 
 service:
+  ## Maintains session affinity.  Should be set to ClientIP for HA setup
+  ## Only options are ClientIP and None.  Do not leave blank.
+  sessionAffinity: None
   ## Annotations to be added to the Service
   ##
   annotations: {}
@@ -114,6 +202,10 @@ service:
   ## List of external IP addresses at which the Prometheus Service will be available
   ##
   externalIPs: []
+
+  ## Labels to be added to the Service
+  ##
+  labels: {}
 
   ## External IP address to assign to Prometheus Service
   ## Only used if service.type is 'LoadBalancer' and supported by cloud provider
@@ -226,8 +318,24 @@ serviceMonitors: []
 ## Ref: https://github.com/coreos/prometheus-operator/blob/master/Documentation/user-guides/storage.md
 ##
 storageSpec: {}
-#   class: default
-#   resources:
-#     requests:
-#       storage: 16Gi
-#   selector: {}
+#  volumeClaimTemplate:
+#    spec:
+#      storageClassName: gluster
+#      accessModes: ["ReadWriteOnce"]
+#      resources:
+#        requests:
+#          storage: 50Gi
+#    selector: {}
+
+# default rules are in templates/prometheus.rules.yaml
+# prometheusRules: {}
+
+## Prometheus AdditionalScrapeConfigs
+## Ref: https://github.com/coreos/prometheus-operator/blob/master/Documentation/api.md#prometheusspec
+##
+additionalScrapeConfigs: []
+# - job_name: "prometheus"
+#   static_configs:
+#   - targets:
+#     - "localhost:9090"
+

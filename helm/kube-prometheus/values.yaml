@@ -1,3 +1,18 @@
+# exporter-node configuration
+deployExporterNode: True
+
+# Grafana
+deployGrafana: True
+
+## If true, create & use RBAC resources resp. Pod Security Policies
+##
+global:
+  rbacEnable: true
+  pspEnable: true
+
+# AlertManager
+deployAlertManager: True
+
 alertmanager:
   ## Alertmanager configuration directives
   ## Ref: https://prometheus.io/docs/alerting/configuration/
@@ -5,18 +20,18 @@ alertmanager:
   config:
     global:
       resolve_timeout: 5m
-
-    receivers:
-      - name: webhook
-        webhook_configs:
-          - url: 'http://alertmanagerwh:30500/'
-
     route:
       group_by: ['job']
-      group_interval: 5m
       group_wait: 30s
-      receiver: webhook
+      group_interval: 5m
       repeat_interval: 12h
+      receiver: 'null'
+      routes:
+      - match:
+          alertname: DeadMansSwitch
+        receiver: 'null'
+    receivers:
+    - name: 'null'
 
   ## External URL at which Alertmanager will be reachable
   ##
@@ -26,7 +41,7 @@ alertmanager:
   ##
   image:
     repository: quay.io/prometheus/alertmanager
-    tag: v0.5.1
+    tag: v0.14.0
 
   ingress:
     ## If true, Alertmanager Ingress will be created
@@ -39,7 +54,16 @@ alertmanager:
       # kubernetes.io/ingress.class: nginx
       # kubernetes.io/tls-acme: "true"
 
-    fqdn: ""
+    ## Labels to be added to the Ingress
+    ##
+    labels: {}
+
+    ## Hostnames.
+    ## Must be provided if Ingress is enabled.
+    ##
+    # hosts:
+    #   - alertmanager.domain.com
+    hosts: []
 
     ## TLS configuration for Alertmanager Ingress
     ## Secret must be manually created in the namespace
@@ -62,12 +86,24 @@ alertmanager:
   ##
   replicaCount: 1
 
+  ## Pod anti-affinity can prevent the scheduler from placing Alertmanager replicas on the same node.
+  ## The default value "soft" means that the scheduler should *prefer* to not schedule two replica pods onto the same node but no guarantee is provided.
+  ## The value "hard" means that the scheduler is *required* to not schedule two replica pods onto the same node.
+  ## The value "" will disable pod anti-affinity so that no anti-affinity rules will be configured.
+  podAntiAffinity: "soft"
+
   ## Resource limits & requests
   ## Ref: https://kubernetes.io/docs/user-guide/compute-resources/
   ##
   resources: {}
     # requests:
     #   memory: 400Mi
+
+  ## List of Secrets in the same namespace as the AlertManager
+  ## object, which shall be mounted into the AlertManager Pods.
+  ## Ref: https://github.com/coreos/prometheus-operator/blob/master/Documentation/api.md#alertmanagerspec
+  ##
+  secrets: []
 
   service:
     ## Annotations to be added to the Service
@@ -105,11 +141,14 @@ alertmanager:
   ## Ref: https://github.com/coreos/prometheus-operator/blob/master/Documentation/user-guides/storage.md
   ##
   storageSpec: {}
-  #   class: default
-  #   resources:
-  #     requests:
-  #       storage: 2Gi
-  #   selector: {}
+  #  volumeClaimTemplate:
+  #    spec:
+  #      storageClassName: gluster
+  #      accessModes: ["ReadWriteOnce"]
+  #      resources:
+  #        requests:
+  #          storage: 50Gi
+  #    selector: {}
 
 prometheus:
   ## Alertmanagers to which alerts will be sent
@@ -137,7 +176,7 @@ prometheus:
   ##
   image:
     repository: quay.io/prometheus/prometheus
-    tag: v1.5.2
+    tag: v2.2.1
 
   ingress:
     ## If true, Prometheus Ingress will be created
@@ -150,7 +189,16 @@ prometheus:
       # kubernetes.io/ingress.class: nginx
       # kubernetes.io/tls-acme: "true"
 
-    fqdn: ""
+    ## Labels to be added to the Ingress
+    ##
+    labels: {}
+
+    ## Hostnames.
+    ## Must be provided if Ingress is enabled.
+    ##
+    # hosts:
+    #   - alertmanager.domain.com
+    hosts: []
 
     ## TLS configuration for Prometheus Ingress
     ## Secret must be manually created in the namespace
@@ -173,12 +221,24 @@ prometheus:
   ##
   replicaCount: 1
 
+  ## Pod anti-affinity can prevent the scheduler from placing Prometheus replicas on the same node.
+  ## The default value "soft" means that the scheduler should *prefer* to not schedule two replica pods onto the same node but no guarantee is provided.
+  ## The value "hard" means that the scheduler is *required* to not schedule two replica pods onto the same node.
+  ## The value "" will disable pod anti-affinity so that no anti-affinity rules will be configured.
+  podAntiAffinity: "soft"
+
   ## Resource limits & requests
   ## Ref: https://kubernetes.io/docs/user-guide/compute-resources/
   ##
   resources: {}
     # requests:
     #   memory: 400Mi
+
+  ## List of Secrets in the same namespace as the Prometheus
+  ## object, which shall be mounted into the Prometheus Pods.
+  ## Ref: https://github.com/coreos/prometheus-operator/blob/master/Documentation/api.md#prometheusspec
+  ##
+  secrets: []
 
   ## How long to retain metrics
   ##
@@ -192,7 +252,19 @@ prometheus:
   ## Rules configmap selector
   ## Ref: https://github.com/coreos/prometheus-operator/blob/master/Documentation/design.md
   ##
+  ## 1. If `matchLabels` is used, `rules.additionalLabels` must contain all the labels from
+  ##    `matchLabels` in order to be be matched by Prometheus
+  ## 2. If `matchExpressions` is used `rules.additionalLabels` must contain at least one label
+  ##    from `matchExpressions` in order to be matched by Prometheus
+  ## Ref: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels
   rulesSelector: {}
+   # rulesSelector: {
+   #   matchExpressions: [{key: prometheus, operator: In, values: [example-rules, example-rules-2]}]
+   # }
+   ### OR
+   # rulesSelector: {
+   #   matchLabels: [{role: example-rules}]
+   # }
 
   ## Prometheus alerting & recording rules
   ## Ref: https://prometheus.io/docs/querying/rules/
@@ -200,6 +272,11 @@ prometheus:
   ##
   rules:
     specifiedInValues: true
+    ## What additional rules to be added to the ConfigMap
+    ## You can use this together with `rulesSelector`
+    additionalLabels: {}
+    #  prometheus: example-rules
+    #  application: etcd
     value: {}
 
   service:
@@ -237,7 +314,24 @@ prometheus:
   ## Service monitors selector
   ## Ref: https://github.com/coreos/prometheus-operator/blob/master/Documentation/design.md
   ##
-  serviceMonitorsSelector: {}
+  serviceMonitorsSelector:
+    matchExpressions:
+    - key: app
+      operator: In
+      values:
+      - alertmanager
+      - exporter-coredns
+      - exporter-kube-controller-manager
+      - exporter-kube-dns
+      - exporter-kube-etcd
+      - exporter-kube-scheduler
+      - exporter-kube-state
+      - exporter-kubelets
+      - exporter-kubernetes
+      - exporter-node
+      - grafana
+      - prometheus
+      - prometheus-operator
 
   ## ServiceMonitor CRDs to create & be scraped by the Prometheus instance.
   ## Ref: https://github.com/coreos/prometheus-operator/blob/master/Documentation/service-monitor.md
@@ -322,8 +416,18 @@ prometheus:
   ## Ref: https://github.com/coreos/prometheus-operator/blob/master/Documentation/user-guides/storage.md
   ##
   storageSpec: {}
-  #   class: default
-  #   resources:
-  #     requests:
-  #       storage: 16Gi
-  #   selector: {}
+  #  volumeClaimTemplate:
+  #    spec:
+  #      storageClassName: gluster
+  #      accessModes: ["ReadWriteOnce"]
+  #      resources:
+  #        requests:
+  #          storage: 50Gi
+  #    selector: {}
+
+# default rules are in templates/general.rules.yaml
+# prometheusRules: {}
+
+# Select Deployed DNS Solution
+deployCoreDNS: false
+deployKubeDNS: true

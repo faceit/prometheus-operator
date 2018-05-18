@@ -3,10 +3,10 @@ kind: Prometheus
 metadata:
   name: prometheus
 spec:
+  serviceAccountName: prometheus
   serviceMonitorSelector:
     matchLabels:
       team: frontend
-  version: v1.7.1
   resources:
     requests:
       memory: 400Mi

@@ -37,6 +37,8 @@ rules:
   resources:
   - alertmanagers
   - prometheuses
+  - prometheuses/finalizers
+  - alertmanagers/finalizers
   - servicemonitors
   verbs:
   - "*"
@@ -62,11 +64,8 @@ rules:
 - apiGroups: [""]
   resources:
   - nodes
-  verbs: ["list", "watch"]
-- apiGroups: [""]
-  resources:
   - namespaces
-  verbs: ["list"]
+  verbs: ["list", "watch"]
 ```
 
 > Note: A cluster admin is required to create this `ClusterRole` and create a `ClusterRoleBinding` or `RoleBinding` to the `ServiceAccount` used by the Prometheus Operator `Pod`. The `ServiceAccount` used by the Prometheus Operator `Pod` can be specified in the `Deployment` object used to deploy it.

@@ -1,143 +1,225 @@
 # kube-prometheus
 
-This repository collects Kubernetes manifests, dashboards, and alerting rules
-combined with documentation and scripts to provide single-command deployments
-of end-to-end Kubernetes cluster monitoring.
+> Note that everything in the `contrib/kube-prometheus/` directory is experimental and may change significantly at any time.
+
+This repository collects Kubernetes manifests, [Grafana](http://grafana.com/) dashboards, and [Prometheus rules](https://prometheus.io/docs/prometheus/latest/configuration/recording_rules/) combined with documentation and scripts to provide easy to operate end-to-end Kubernetes cluster monitoring with [Prometheus](https://prometheus.io/) using the Prometheus Operator.
+
+The content of this project is written in [jsonnet](http://jsonnet.org/). This project could both be described as a package as well as a library.
+
+Components included in this package:
+
+* The [Prometheus Operator](https://github.com/coreos/prometheus-operator)
+* Highly available [Prometheus](https://prometheus.io/)
+* Highly available [Alertmanager](https://github.com/prometheus/alertmanager)
+* [Prometheus node-exporter](https://github.com/prometheus/node_exporter)
+* [kube-state-metrics](https://github.com/kubernetes/kube-state-metrics)
+* [Grafana](https://grafana.com/)
+
+This stack is meant for cluster monitoring, so it is pre-configured to collect metrics from all Kubernetes components. In addition to that it delivers a default set of dashboards and alerting rules. Many of the useful dashboards and alerts come from the [kubernetes-mixin project](https://github.com/kubernetes-monitoring/kubernetes-mixin), similar to this project it provides composable jsonnet as a library for users to customize to their needs.
 
 ## Prerequisites
 
-First, you need a running Kubernetes cluster. If you don't have one, follow the
-instructions of [bootkube](https://github.com/kubernetes-incubator/bootkube) or
-[minikube](https://github.com/kubernetes/minikube). Some sample contents of this
-repository are adapted to work with a [multi-node setup](https://github.com/kubernetes-incubator/bootkube/tree/master/hack/multi-node)
-using [bootkube](https://github.com/kubernetes-incubator/bootkube).
+You will need a Kubernetes cluster, that's it! By default it is assumed, that the kubelet uses token authN and authZ, as otherwise Prometheus needs a client certificate, which gives it full access to the kubelet, rather than just the metrics. Token authN and authZ allows more fine grained and easier access control.
 
-## Monitoring Kubernetes
+### minikube
 
-The manifests used here use the [Prometheus Operator](https://github.com/coreos/prometheus-operator),
-which manages Prometheus servers and their configuration in a cluster. With a single command we can install
+In order to just try out this stack, start minikube with the following command:
 
-* The Operator itself
-* The Prometheus [node_exporter](https://github.com/prometheus/node_exporter)
-* [kube-state-metrics](https://github.com/kubernetes/kube-state-metrics)
-* The [Prometheus specification](https://github.com/coreos/prometheus-operator/blob/master/Documentation/api.md#prometheus) based on which the Operator deploys a Prometheus setup
-* A Prometheus configuration covering monitoring of all Kubernetes core components and exporters
-* A default set of alerting rules on the cluster component's health
-* A Grafana instance serving dashboards on cluster metrics
-* A three node highly available Alertmanager cluster
-
-Simply run:
-
-```bash
-export KUBECONFIG=<path>          # defaults to "~/.kube/config"
-hack/cluster-monitoring/deploy
+```
+$ minikube delete && minikube start --kubernetes-version=v1.10.1 --memory=4096 --bootstrapper=kubeadm --extra-config=kubelet.authentication-token-webhook=true --extra-config=kubelet.authorization-mode=Webhook --extra-config=scheduler.address=0.0.0.0 --extra-config=controller-manager.address=0.0.0.0
 ```
 
-After all pods are ready, you can reach:
+## Quickstart
 
-* Prometheus UI on node port `30900`
-* Alertmanager UI on node port `30903`
-* Grafana on node port `30902`
+Although this project is intended to be used as a library, a compiled version of the Kubernetes manifests generated with this library is checked into this repository in order to try the content out quickly.
 
-To tear it all down again, run:
+Simply create the stack:
 
-```bash
-hack/cluster-monitoring/teardown
+```
+$ kubectl create -f manifests/
 ```
 
-## Monitoring custom services
+## Usage
 
-The example manifests in [/manifests/examples/example-app](/contrib/kube-prometheus/manifests/examples/example-app)
-deploy a fake service exposing Prometheus metrics. They additionally define a new Prometheus
-server and a [`ServiceMonitor`](https://github.com/coreos/prometheus-operator/blob/master/Documentation/design.md#servicemonitor),
-which specifies how the example service should be monitored.
-The Prometheus Operator will deploy and configure the desired Prometheus instance and continiously
-manage its life cycle.
+The content of this project consists of a set of [jsonnet](http://jsonnet.org/) files making up a library to be consumed.
 
-```bash
-hack/example-service-monitoring/deploy
+Install this library in your own project with [jsonnet-bundler](https://github.com/jsonnet-bundler/jsonnet-bundler#install):
+
+```
+$ mkdir my-kube-prometheus; cd my-kube-prometheus
+$ jb init
+$ jb install github.com/coreos/prometheus-operator/contrib/kube-prometheus/jsonnet/kube-prometheus
 ```
 
-After all pods are ready you can reach the Prometheus server on node port `30100` and observe
-how it monitors the service as specified. Same as before, this Prometheus server automatically
-discovers the Alertmanager cluster deployed in the [Monitoring Kubernetes](#Monitoring-Kubernetes)
-section.
+> `jb` can be installed with `go get github.com/jsonnet-bundler/jsonnet-bundler/cmd/jb`
 
-Teardown:
+You may wish to not use ksonnet and simply render the generated manifests to files on disk, this can be done with:
 
-```bash
-hack/example-service-monitoring/teardown
+[embedmd]:# (example.jsonnet)
+```jsonnet
+local kp = (import 'kube-prometheus/kube-prometheus.libsonnet') + {
+  _config+:: {
+    namespace: 'monitoring',
+  },
+};
+
+{ ['00namespace-' + name]: kp.kubePrometheus[name] for name in std.objectFields(kp.kubePrometheus) } +
+{ ['0prometheus-operator-' + name]: kp.prometheusOperator[name] for name in std.objectFields(kp.prometheusOperator) } +
+{ ['node-exporter-' + name]: kp.nodeExporter[name] for name in std.objectFields(kp.nodeExporter) } +
+{ ['kube-state-metrics-' + name]: kp.kubeStateMetrics[name] for name in std.objectFields(kp.kubeStateMetrics) } +
+{ ['alertmanager-' + name]: kp.alertmanager[name] for name in std.objectFields(kp.alertmanager) } +
+{ ['prometheus-' + name]: kp.prometheus[name] for name in std.objectFields(kp.prometheus) } +
+{ ['grafana-' + name]: kp.grafana[name] for name in std.objectFields(kp.grafana) }
 ```
 
-## Dashboarding
+This renders all manifests in a json structure of `{filename: manifest-content}`.
 
-The provided manifests deploy a Grafana instance serving dashboards provided via a ConfigMap.
-To modify, delete, or add dashboards, the `grafana-dashboards` ConfigMap must be modified.
+### Compiling
 
-Currently, Grafana does not support serving dashboards from static files. Instead, the `grafana-watcher`
-sidecar container aims to emulate the behavior, by keeping the Grafana database always in sync
-with the provided ConfigMap. Hence, the Grafana pod is effectively stateless.
-This allows managing dashboards via `git` etc. and easily deploying them via CD pipelines.
+To compile the above and get each manifest in a separate file on disk use the following script:
 
-For information about how to update/handle the dashboards check [Developing alerts and dashboards](docs/developing-alerts-and-dashboards.md) doc.
+[embedmd]:# (build.sh)
+```sh
+#!/usr/bin/env bash
+set -e
+set -x
+# only exit with zero if all commands of the pipeline exit successfully
+set -o pipefail
 
-In the future, a separate Grafana operator will support gathering dashboards from multiple
-ConfigMaps based on label selection.
+                                               # optional, but we would like to generate yaml, not json
+jsonnet -J vendor -m manifests example.jsonnet | xargs -I{} sh -c 'cat $1 | gojsontoyaml > $1.yaml; rm -f $1' -- {}
 
-WARNING: If you deploy multiple Grafana instances for HA, you must use session affinity.
-Otherwise if pods restart the prometheus datasource ID can get out of sync between the pods, breaking the UI
-
-## Roadmap
-
-* Grafana Operator that dynamically discovers and deploys dashboards from ConfigMaps
-* KPM/Helm packages to easily provide production-ready cluster-monitoring setup (essentially contents of `hack/cluster-monitoring`)
-* Add meta-monitoring to default cluster monitoring setup
-* Build out the provided dashboards and alerts for cluster monitoring to have full coverage of all system aspects
-
-## Monitoring other Cluster Components
-
-Discovery of API servers and kubelets works the same across all clusters.
-Depending on a cluster's setup several other core components, such as etcd or the
-scheduler, may be deployed in different ways.
-The easiest integration point is for the cluster operator to provide headless services
-of all those components to provide a common interface of discovering them. With that
-setup they will automatically be discovered by the provided Prometheus configuration.
-
-For the `kube-scheduler` and `kube-controller-manager` there are headless
-services prepared, simply add them to your running cluster:
-
-```bash
-kubectl -n kube-system create -f manifests/k8s/
 ```
 
-> Hint: if you use this for a cluster not created with bootkube, make sure you
-> populate an endpoints object with the address to your `kube-scheduler` and
-> `kube-controller-manager`, or adapt the label selectors to match your setup.
+> Note you need `jsonnet` and `gojsonyaml` (`go get github.com/brancz/gojsontoyaml`) installed. If you just want json output, not yaml, then you can skip the pipe and everything afterwards.
 
-Aside from Kubernetes specific components, etcd is an important part of a
-working cluster, but is typically deployed outside of it. This monitoring
-setup assumes that it is made visible from within the cluster through a headless
-service as well.
+This script reads each key of the generated json and uses that as the file name, and writes the value of that key to that file.
 
-> Note that minikube hides some components like etcd so to see the extend of
-> this setup we recommend setting up a [local cluster using bootkube](https://github.com/kubernetes-incubator/bootkube/tree/master/hack/multi-node).
+## Configuration
 
-An example for bootkube's multi-node vagrant setup is [here](/contrib/kube-prometheus/manifests/etcd/etcd-bootkube-vagrant-multi.yaml).
+A hidden `_config` field is located at the top level of the object this library provides. These are the available fields with their respective default values:
 
-> Hint: this is merely an example for a local setup. The addresses will have to
-> be adapted for a setup, that is not a single etcd bootkube created cluster.
+```
+{
+	_config+:: {
+        namespace: "default",
 
-With that setup the headless services provide endpoint lists consumed by
-Prometheus to discover the endpoints as targets:
+        versions+:: {
+            alertmanager: "v0.14.0",
+            nodeExporter: "v0.15.2",
+            kubeStateMetrics: "v1.3.0",
+            kubeRbacProxy: "v0.3.0",
+            addonResizer: "1.0",
+            prometheusOperator: "v0.18.1",
+            prometheus: "v2.2.1",
+        },
 
-```bash
-$ kubectl get endpoints --all-namespaces
-NAMESPACE     NAME                                           ENDPOINTS          AGE
-default       kubernetes                                     172.17.4.101:443   2h
-kube-system   kube-controller-manager-prometheus-discovery   10.2.30.2:10252    1h
-kube-system   kube-scheduler-prometheus-discovery            10.2.30.4:10251    1h
-monitoring    etcd-k8s                                       172.17.4.51:2379   1h
+        imageRepos+:: {
+            prometheus: "quay.io/prometheus/prometheus",
+            alertmanager: "quay.io/prometheus/alertmanager",
+            kubeStateMetrics: "quay.io/coreos/kube-state-metrics",
+            kubeRbacProxy: "quay.io/coreos/kube-rbac-proxy",
+            addonResizer: "quay.io/coreos/addon-resizer",
+            nodeExporter: "quay.io/prometheus/node-exporter",
+            prometheusOperator: "quay.io/coreos/prometheus-operator",
+        },
+
+        prometheus+:: {
+            replicas: 2,
+            rules: {},
+        },
+
+        alertmanager+:: {
+            config: alertmanagerConfig,
+            replicas: 3,
+        },
+	},
+}
 ```
 
-## Other Documentation
-[Install Docs for a cluster created with KOPS on AWS](docs/KOPSonAWS.md)
+## Customization
+
+Jsonnet is a turing complete language, any logic can be reflected in it. It also has powerful merge functionalities, allowing sophisticated customizations of any kind simply by merging it into the object the library provides.
+
+A common example is that not all Kubernetes clusters are created exactly the same way, meaning the configuration to monitor them may be slightly different. For [kubeadm]() and [bootkube]() clusters there are mixins available to easily configure these:
+
+kubeadm:
+
+[embedmd]:# (examples/kubeadm.jsonnet)
+```jsonnet
+(import "kube-prometheus/kube-prometheus.libsonnet") +
+(import "kube-prometheus/kube-prometheus-kubeadm.libsonnet")
+```
+
+bootkube:
+
+[embedmd]:# (examples/bootkube.jsonnet)
+```jsonnet
+(import "kube-prometheus/kube-prometheus.libsonnet") +
+(import "kube-prometheus/kube-prometheus-bootkube.libsonnet")
+```
+
+Another mixin that may be useful for exploring the stack is to expose the UIs of Prometheus, Alertmanager and Grafana on NodePorts:
+
+[embedmd]:# (examples/node-ports.jsonnet)
+```jsonnet
+(import "kube-prometheus/kube-prometheus.libsonnet") +
+(import "kube-prometheus/kube-prometheus-node-ports.libsonnet")
+```
+
+For example the name of the `Prometheus` object provided by this library can be overridden:
+
+[embedmd]:# (examples/prometheus-name-override.jsonnet)
+```jsonnet
+((import "kube-prometheus/kube-prometheus.libsonnet") + {
+	prometheus+: {
+		prometheus+: {
+			metadata+: {
+				name: "my-name",
+			}
+		}
+	}
+}).prometheus.prometheus
+```
+
+Standard Kubernetes manifests are all written using [ksonnet-lib](https://github.com/ksonnet/ksonnet-lib/), so they can be modified with the mixins supplied by ksonnet-lib. For example to override the namespace of the node-exporter DaemonSet:
+
+[embedmd]:# (examples/ksonnet-example.jsonnet)
+```jsonnet
+local k = import "ksonnet/ksonnet.beta.3/k.libsonnet";
+local daemonset = k.apps.v1beta2.daemonSet;
+
+((import "kube-prometheus/kube-prometheus.libsonnet") + {
+	nodeExporter+: {
+		daemonset+:
+            daemonset.mixin.metadata.withNamespace("my-custom-namespace")
+    }
+}).nodeExporter.daemonset
+```
+
+## Example
+
+To use an easy to reproduce example, let's take the minikube setup as demonstrated in [prerequisites](#Prerequisites). It is a kubeadm cluster (as we use the kubeadm bootstrapper) and because we would like easy access to our Prometheus, Alertmanager and Grafana UI we want the services to be exposed as NodePort type services:
+
+> Note that NodePort type services is likely not a good idea for your production use case, it is only used for demonstration purposes here.
+
+[embedmd]:# (examples/minikube.jsonnet)
+```jsonnet
+local kp =
+  (import 'kube-prometheus/kube-prometheus.libsonnet') +
+  (import 'kube-prometheus/kube-prometheus-kubeadm.libsonnet') +
+  (import 'kube-prometheus/kube-prometheus-node-ports.libsonnet') +
+  {
+    _config+:: {
+      namespace: 'monitoring',
+    },
+  };
+
+{ ['00namespace-' + name]: kp.kubePrometheus[name] for name in std.objectFields(kp.kubePrometheus) } +
+{ ['0prometheus-operator-' + name]: kp.prometheusOperator[name] for name in std.objectFields(kp.prometheusOperator) } +
+{ ['node-exporter-' + name]: kp.nodeExporter[name] for name in std.objectFields(kp.nodeExporter) } +
+{ ['kube-state-metrics-' + name]: kp.kubeStateMetrics[name] for name in std.objectFields(kp.kubeStateMetrics) } +
+{ ['alertmanager-' + name]: kp.alertmanager[name] for name in std.objectFields(kp.alertmanager) } +
+{ ['prometheus-' + name]: kp.prometheus[name] for name in std.objectFields(kp.prometheus) } +
+{ ['grafana-' + name]: kp.grafana[name] for name in std.objectFields(kp.grafana) }
+```

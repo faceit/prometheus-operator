@@ -30,16 +30,27 @@ Once you complete this guide you will monitor the following:
 
 The manifests used here use the [Prometheus Operator](https://github.com/coreos/prometheus-operator), which manages Prometheus servers and their configuration in a cluster. Prometheus discovers targets through `Endpoints` objects, which means all targets that are running as `Pod`s in the Kubernetes cluster are easily monitored. Many Kubernetes components can be [self-hosted](https://coreos.com/blog/self-hosted-kubernetes.html) today. The kubelet, however, is not. Therefore the Prometheus Operator implements a functionality to synchronize the kubelets into an `Endpoints` object. To make use of that functionality the `--kubelet-service` argument must be passed to the Prometheus Operator when running it.
 
-[embedmd]:# (../../contrib/kube-prometheus/manifests/prometheus-operator/prometheus-operator.yaml)
+
+> We assume that the kubelet uses token authN and authZ, as otherwise Prometheus needs a client certificate, which gives it full access to the kubelet, rather than just the metrics. Token authN and authZ allows more fine grained and easier access control. Simply start minikube with the following command (you can of course adapt the version and memory to your needs):
+>
+> $ minikube delete && minikube start --kubernetes-version=v1.9.1 --memory=4096 --bootstrapper=kubeadm --extra-config=kubelet.authentication-token-webhook=true --extra-config=kubelet.authorization-mode=Webhook --extra-config=scheduler.address=0.0.0.0 --extra-config=controller-manager.address=0.0.0.0
+>
+> In future versions of minikube and kubeadm this will be the default, but for the time being, we will have to configure it ourselves.
+
+[embedmd]:# (../../contrib/kube-prometheus/manifests/0prometheus-operator-deployment.yaml)
 ```yaml
-apiVersion: extensions/v1beta1
+apiVersion: apps/v1beta2
 kind: Deployment
 metadata:
   labels:
     k8s-app: prometheus-operator
   name: prometheus-operator
+  namespace: monitoring
 spec:
   replicas: 1
+  selector:
+    matchLabels:
+      k8s-app: prometheus-operator
   template:
     metadata:
       labels:
@@ -49,7 +60,7 @@ spec:
       - args:
         - --kubelet-service=kube-system/kubelet
         - --config-reloader-image=quay.io/coreos/configmap-reload:v0.0.1
-        image: quay.io/coreos/prometheus-operator:v0.13.0
+        image: quay.io/coreos/prometheus-operator:v0.19.0
         name: prometheus-operator
         ports:
         - containerPort: 8080
@@ -61,6 +72,11 @@ spec:
           requests:
             cpu: 100m
             memory: 50Mi
+      nodeSelector:
+        beta.kubernetes.io/os: linux
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
       serviceAccountName: prometheus-operator
 ```
 
@@ -72,9 +88,10 @@ By default every Kubernetes cluster has a `Service` for easy access to the API s
 
 Aside from the kubelet and the API server the other Kubernetes components all run on top of Kubernetes itself. To discover Kubernetes components that run in a Pod, they simply have to be added to a `Service`.
 
+> Note the `Service` manifests for the scheduler and controller-manager are just examples. They may need to be adapted respective to a cluster.
+
 kube-scheduler:
 
-[embedmd]:# (../../contrib/kube-prometheus/manifests/k8s/self-hosted/kube-scheduler.yaml)
 ```yaml
 apiVersion: v1
 kind: Service
@@ -97,7 +114,6 @@ spec:
 
 kube-controller-manager:
 
-[embedmd]:# (../../contrib/kube-prometheus/manifests/k8s/self-hosted/kube-controller-manager.yaml)
 ```yaml
 apiVersion: v1
 kind: Service
@@ -122,359 +138,465 @@ spec:
 
 Unrelated to Kubernetes itself, but still important is to gather various metrics about the actual nodes. Typical metrics are CPU, memory, disk and network utilization, all of these metrics can be gathered using the node_exporter.
 
-[embedmd]:# (../../contrib/kube-prometheus/manifests/node-exporter/node-exporter-daemonset.yaml)
+[embedmd]:# (../../contrib/kube-prometheus/manifests/node-exporter-daemonset.yaml)
 ```yaml
-apiVersion: extensions/v1beta1
+apiVersion: apps/v1beta2
 kind: DaemonSet
 metadata:
+  labels:
+    app: node-exporter
   name: node-exporter
+  namespace: monitoring
 spec:
+  selector:
+    matchLabels:
+      app: node-exporter
   template:
     metadata:
       labels:
         app: node-exporter
-      name: node-exporter
     spec:
-      hostNetwork: true
-      hostPID: true
       containers:
-      - image:  quay.io/prometheus/node-exporter:v0.14.0
-        args:
-        - "-collector.procfs=/host/proc"
-        - "-collector.sysfs=/host/sys"
+      - args:
+        - --web.listen-address=127.0.0.1:9101
+        - --path.procfs=/host/proc
+        - --path.sysfs=/host/sys
+        image: quay.io/prometheus/node-exporter:v0.15.2
         name: node-exporter
+        resources:
+          limits:
+            cpu: 102m
+            memory: 180Mi
+          requests:
+            cpu: 102m
+            memory: 180Mi
+        volumeMounts:
+        - mountPath: /host/proc
+          name: proc
+          readOnly: false
+        - mountPath: /host/sys
+          name: sys
+          readOnly: false
+      - args:
+        - --secure-listen-address=:9100
+        - --upstream=http://127.0.0.1:9101/
+        image: quay.io/coreos/kube-rbac-proxy:v0.3.0
+        name: kube-rbac-proxy
         ports:
         - containerPort: 9100
-          hostPort: 9100
-          name: scrape
+          name: https
         resources:
-          requests:
-            memory: 30Mi
-            cpu: 100m
           limits:
-            memory: 50Mi
-            cpu: 200m
-        volumeMounts:
-        - name: proc
-          readOnly:  true
-          mountPath: /host/proc
-        - name: sys
-          readOnly: true
-          mountPath: /host/sys
+            cpu: 20m
+            memory: 40Mi
+          requests:
+            cpu: 10m
+            memory: 20Mi
+      nodeSelector:
+        beta.kubernetes.io/os: linux
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+      serviceAccountName: node-exporter
       tolerations:
-        - effect: NoSchedule
-          operator: Exists
+      - effect: NoSchedule
+        key: node-role.kubernetes.io/master
       volumes:
-      - name: proc
-        hostPath:
+      - hostPath:
           path: /proc
-      - name: sys
-        hostPath:
+        name: proc
+      - hostPath:
           path: /sys
-
+        name: sys
 ```
+
+The respective `ServiceAccount` manifest:
+
+[embedmd]:# (../../contrib/kube-prometheus/manifests/node-exporter-serviceAccount.yaml)
+```yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: node-exporter
+  namespace: monitoring
+```
+
 
 And the respective `Service` manifest:
 
-[embedmd]:# (../../contrib/kube-prometheus/manifests/node-exporter/node-exporter-service.yaml)
+[embedmd]:# (../../contrib/kube-prometheus/manifests/node-exporter-service.yaml)
 ```yaml
 apiVersion: v1
 kind: Service
 metadata:
   labels:
-    app: node-exporter
     k8s-app: node-exporter
   name: node-exporter
+  namespace: monitoring
 spec:
-  type: ClusterIP
   clusterIP: None
   ports:
-  - name: http-metrics
+  - name: https
     port: 9100
-    protocol: TCP
+    targetPort: https
   selector:
     app: node-exporter
-
 ```
 
 And last but not least, kube-state-metrics which collects information about Kubernetes objects themselves as they are accessible from the API. Find more information on what kind of metrics kube-state-metrics exposes in [its repository](https://github.com/kubernetes/kube-state-metrics).
 
-[embedmd]:# (../../contrib/kube-prometheus/manifests/kube-state-metrics/kube-state-metrics-deployment.yaml)
+[embedmd]:# (../../contrib/kube-prometheus/manifests/kube-state-metrics-deployment.yaml)
 ```yaml
-apiVersion: extensions/v1beta1
+apiVersion: apps/v1beta2
 kind: Deployment
 metadata:
+  labels:
+    app: kube-state-metrics
   name: kube-state-metrics
+  namespace: monitoring
 spec:
   replicas: 1
+  selector:
+    matchLabels:
+      app: kube-state-metrics
   template:
     metadata:
       labels:
         app: kube-state-metrics
     spec:
-      serviceAccountName: kube-state-metrics
       containers:
-      - name: kube-state-metrics
-        image: quay.io/coreos/kube-state-metrics:v1.0.1
+      - args:
+        - --secure-listen-address=:8443
+        - --upstream=http://127.0.0.1:8081/
+        image: quay.io/coreos/kube-rbac-proxy:v0.3.0
+        name: kube-rbac-proxy-main
         ports:
-        - name: metrics
-          containerPort: 8080
-        readinessProbe:
-          httpGet:
-            path: /healthz
-            port: 8080
-          initialDelaySeconds: 5
-          timeoutSeconds: 5
-        resources:
-          requests:
-            memory: 100Mi
-            cpu: 100m
-          limits:
-            memory: 200Mi
-            cpu: 200m
-      - name: addon-resizer
-        image: gcr.io/google_containers/addon-resizer:1.0
+        - containerPort: 8443
+          name: https-main
         resources:
           limits:
-            cpu: 100m
-            memory: 30Mi
+            cpu: 20m
+            memory: 40Mi
           requests:
-            cpu: 100m
-            memory: 30Mi
+            cpu: 10m
+            memory: 20Mi
+      - args:
+        - --secure-listen-address=:9443
+        - --upstream=http://127.0.0.1:8082/
+        image: quay.io/coreos/kube-rbac-proxy:v0.3.0
+        name: kube-rbac-proxy-self
+        ports:
+        - containerPort: 9443
+          name: https-self
+        resources:
+          limits:
+            cpu: 20m
+            memory: 40Mi
+          requests:
+            cpu: 10m
+            memory: 20Mi
+      - args:
+        - --host=127.0.0.1
+        - --port=8081
+        - --telemetry-host=127.0.0.1
+        - --telemetry-port=8082
+        image: quay.io/coreos/kube-state-metrics:v1.3.0
+        name: kube-state-metrics
+        resources:
+          limits:
+            cpu: 102m
+            memory: 180Mi
+          requests:
+            cpu: 102m
+            memory: 180Mi
+      - command:
+        - /pod_nanny
+        - --container=kube-state-metrics
+        - --cpu=100m
+        - --extra-cpu=2m
+        - --memory=150Mi
+        - --extra-memory=30Mi
+        - --threshold=5
+        - --deployment=kube-state-metrics
         env:
-          - name: MY_POD_NAME
-            valueFrom:
-              fieldRef:
-                fieldPath: metadata.name
-          - name: MY_POD_NAMESPACE
-            valueFrom:
-              fieldRef:
-                fieldPath: metadata.namespace
-        command:
-          - /pod_nanny
-          - --container=kube-state-metrics
-          - --cpu=100m
-          - --extra-cpu=1m
-          - --memory=100Mi
-          - --extra-memory=2Mi
-          - --threshold=5
-          - --deployment=kube-state-metrics
+        - name: MY_POD_NAME
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.name
+        - name: MY_POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              apiVersion: v1
+              fieldPath: metadata.namespace
+        image: quay.io/coreos/addon-resizer:1.0
+        name: addon-resizer
+        resources:
+          limits:
+            cpu: 10m
+            memory: 30Mi
+          requests:
+            cpu: 10m
+            memory: 30Mi
+      nodeSelector:
+        beta.kubernetes.io/os: linux
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+      serviceAccountName: kube-state-metrics
 ```
 
 > Make sure that the `ServiceAccount` called `kube-state-metrics` exists and if using RBAC, is bound to the correct role. See the kube-state-metrics [repository for RBAC requirements](https://github.com/kubernetes/kube-state-metrics/tree/master/kubernetes).
 
 And the respective `Service` manifest:
 
-[embedmd]:# (../../contrib/kube-prometheus/manifests/kube-state-metrics/kube-state-metrics-service.yaml)
+[embedmd]:# (../../contrib/kube-prometheus/manifests/kube-state-metrics-service.yaml)
 ```yaml
 apiVersion: v1
 kind: Service
 metadata:
   labels:
-    app: kube-state-metrics
     k8s-app: kube-state-metrics
   name: kube-state-metrics
+  namespace: monitoring
 spec:
+  clusterIP: None
   ports:
-  - name: http-metrics
-    port: 8080
-    targetPort: metrics
-    protocol: TCP
+  - name: https-main
+    port: 8443
+    targetPort: https-main
+  - name: https-self
+    port: 9443
+    targetPort: https-self
   selector:
     app: kube-state-metrics
-
 ```
 
 ## Setup Monitoring
 
 Once all the steps in the previous section have been taken there should be `Endpoints` objects containing the IPs of all of the above mentioned Kubernetes components. Now to setup the actual Prometheus and Alertmanager clusters. This manifest assumes that the Alertmanager cluster will be deployed in the `monitoring` namespace.
 
-[embedmd]:# (../../contrib/kube-prometheus/manifests/prometheus/prometheus-k8s.yaml)
+[embedmd]:# (../../contrib/kube-prometheus/manifests/prometheus-prometheus.yaml)
 ```yaml
 apiVersion: monitoring.coreos.com/v1
 kind: Prometheus
 metadata:
-  name: k8s
   labels:
     prometheus: k8s
+  name: k8s
+  namespace: monitoring
 spec:
+  alerting:
+    alertmanagers:
+    - name: alertmanager-main
+      namespace: monitoring
+      port: web
+  baseImage: quay.io/prometheus/prometheus
+  nodeSelector:
+    beta.kubernetes.io/os: linux
   replicas: 2
-  version: v1.7.1
+  resources:
+    requests:
+      memory: 400Mi
+  ruleSelector:
+    matchLabels:
+      prometheus: k8s
+      role: alert-rules
   serviceAccountName: prometheus-k8s
   serviceMonitorSelector:
     matchExpressions:
-    - {key: k8s-app, operator: Exists}
-  ruleSelector:
-    matchLabels:
-      role: prometheus-rulefiles
-      prometheus: k8s
-  resources:
-    requests:
-      # 2Gi is default, but won't schedule if you don't have a node with >2Gi
-      # memory. Modify based on your target and time-series count for
-      # production use. This value is mainly meant for demonstration/testing
-      # purposes.
-      memory: 400Mi
-  alerting:
-    alertmanagers:
-    - namespace: monitoring
-      name: alertmanager-main
-      port: web
+    - key: k8s-app
+      operator: Exists
+  version: v2.2.1
 ```
 
 > Make sure that the `ServiceAccount` called `prometheus-k8s` exists and if using RBAC, is bound to the correct role. Read more on [RBAC when using the Prometheus Operator](../rbac.md).
 
 The expression to match for selecting `ServiceMonitor`s here is that they must have a label which has a key called `k8s-app`. If you look closely at all the `Service` objects described above they all have a label called `k8s-app` and their component name this allows to conveniently select them with `ServiceMonitor`s.
 
-[embedmd]:# (../../contrib/kube-prometheus/manifests/prometheus/prometheus-k8s-service-monitor-apiserver.yaml)
+[embedmd]:# (../../contrib/kube-prometheus/manifests/prometheus-serviceMonitorApiserver.yaml)
 ```yaml
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: kube-apiserver
   labels:
     k8s-app: apiserver
+  name: kube-apiserver
+  namespace: monitoring
 spec:
-  jobLabel: component
-  selector:
-    matchLabels:
-      component: apiserver
-      provider: kubernetes
-  namespaceSelector:
-    matchNames:
-    - default
   endpoints:
-  - port: https
+  - bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
     interval: 30s
+    port: https
     scheme: https
     tlsConfig:
       caFile: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
       serverName: kubernetes
-    bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+  jobLabel: component
+  namespaceSelector:
+    matchNames:
+    - default
+  selector:
+    matchLabels:
+      component: apiserver
+      provider: kubernetes
 ```
 
-[embedmd]:# (../../contrib/kube-prometheus/manifests/prometheus/prometheus-k8s-service-monitor-kubelet.yaml)
+[embedmd]:# (../../contrib/kube-prometheus/manifests/prometheus-serviceMonitorKubelet.yaml)
 ```yaml
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: kubelet
   labels:
     k8s-app: kubelet
+  name: kubelet
+  namespace: monitoring
 spec:
-  jobLabel: k8s-app
   endpoints:
-  - port: http-metrics
+  - bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
     interval: 30s
-  - port: cadvisor
-    interval: 30s
+    port: https-metrics
+    scheme: https
+    tlsConfig:
+      insecureSkipVerify: true
+  - bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
     honorLabels: true
+    interval: 30s
+    path: /metrics/cadvisor
+    port: https-metrics
+    scheme: https
+    tlsConfig:
+      insecureSkipVerify: true
+  jobLabel: k8s-app
+  namespaceSelector:
+    matchNames:
+    - kube-system
   selector:
     matchLabels:
       k8s-app: kubelet
-  namespaceSelector:
-    matchNames:
-    - kube-system
 ```
 
-[embedmd]:# (../../contrib/kube-prometheus/manifests/prometheus/prometheus-k8s-service-monitor-kube-controller-manager.yaml)
+[embedmd]:# (../../contrib/kube-prometheus/manifests/prometheus-serviceMonitorKubeControllerManager.yaml)
 ```yaml
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: kube-controller-manager
   labels:
     k8s-app: kube-controller-manager
+  name: kube-controller-manager
+  namespace: monitoring
 spec:
-  jobLabel: k8s-app
   endpoints:
-  - port: http-metrics
-    interval: 30s
+  - interval: 30s
+    port: http-metrics
+  jobLabel: k8s-app
+  namespaceSelector:
+    matchNames:
+    - kube-system
   selector:
     matchLabels:
       k8s-app: kube-controller-manager
-  namespaceSelector:
-    matchNames:
-    - kube-system
 ```
 
-[embedmd]:# (../../contrib/kube-prometheus/manifests/prometheus/prometheus-k8s-service-monitor-kube-scheduler.yaml)
+[embedmd]:# (../../contrib/kube-prometheus/manifests/prometheus-serviceMonitorKubeScheduler.yaml)
 ```yaml
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: kube-scheduler
   labels:
     k8s-app: kube-scheduler
+  name: kube-scheduler
+  namespace: monitoring
 spec:
-  jobLabel: k8s-app
   endpoints:
-  - port: http-metrics
-    interval: 30s
+  - interval: 30s
+    port: http-metrics
+  jobLabel: k8s-app
+  namespaceSelector:
+    matchNames:
+    - kube-system
   selector:
     matchLabels:
       k8s-app: kube-scheduler
-  namespaceSelector:
-    matchNames:
-    - kube-system
 ```
 
-[embedmd]:# (../../contrib/kube-prometheus/manifests/prometheus/prometheus-k8s-service-monitor-kube-state-metrics.yaml)
+[embedmd]:# (../../contrib/kube-prometheus/manifests/kube-state-metrics-serviceMonitor.yaml)
 ```yaml
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: kube-state-metrics
   labels:
     k8s-app: kube-state-metrics
+  name: kube-state-metrics
+  namespace: monitoring
 spec:
+  endpoints:
+  - bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+    honorLabels: true
+    interval: 30s
+    port: https-main
+    scheme: https
+    tlsConfig:
+      insecureSkipVerify: true
+  - bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+    interval: 30s
+    port: https-self
+    scheme: https
+    tlsConfig:
+      insecureSkipVerify: true
   jobLabel: k8s-app
+  namespaceSelector:
+    matchNames:
+    - monitoring
   selector:
     matchLabels:
       k8s-app: kube-state-metrics
-  namespaceSelector:
-    matchNames:
-    - monitoring
-  endpoints:
-  - port: http-metrics
-    interval: 30s
-    honorLabels: true
 ```
 
-[embedmd]:# (../../contrib/kube-prometheus/manifests/prometheus/prometheus-k8s-service-monitor-node-exporter.yaml)
+[embedmd]:# (../../contrib/kube-prometheus/manifests/node-exporter-serviceMonitor.yaml)
 ```yaml
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
-  name: node-exporter
   labels:
     k8s-app: node-exporter
+  name: node-exporter
+  namespace: monitoring
 spec:
+  endpoints:
+  - bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+    interval: 30s
+    port: https
+    scheme: https
+    tlsConfig:
+      insecureSkipVerify: true
   jobLabel: k8s-app
-  selector:
-    matchLabels:
-      k8s-app: node-exporter
   namespaceSelector:
     matchNames:
     - monitoring
-  endpoints:
-  - port: http-metrics
-    interval: 30s
+  selector:
+    matchLabels:
+      k8s-app: node-exporter
 ```
 
 And the Alertmanager:
 
-[embedmd]:# (../../contrib/kube-prometheus/manifests/alertmanager/alertmanager.yaml)
+[embedmd]:# (../../contrib/kube-prometheus/manifests/alertmanager-alertmanager.yaml)
 ```yaml
 apiVersion: monitoring.coreos.com/v1
 kind: Alertmanager
 metadata:
-  name: main
   labels:
     alertmanager: main
+  name: main
+  namespace: monitoring
 spec:
+  baseImage: quay.io/prometheus/alertmanager
+  nodeSelector:
+    beta.kubernetes.io/os: linux
   replicas: 3
-  version: v0.7.1
+  serviceAccountName: alertmanager-main
+  version: v0.14.0
 ```
 
 Read more in the [alerting guide](alerting.md) on how to configure the Alertmanager as it will not spin up unless it has a valid configuration mounted through a `Secret`. Note that the `Secret` has to be in the same namespace as the `Alertmanager` resource as well as have the name `alertmanager-<name-of-alertmanager-object` and the key of the configuration is `alertmanager.yaml`.

@@ -23,11 +23,11 @@ import (
 	"sort"
 	"strings"
 
+	appsv1 "k8s.io/api/apps/v1beta2"
+	"k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/client-go/pkg/api/v1"
-	"k8s.io/client-go/pkg/apis/apps/v1beta1"
 
 	"github.com/blang/semver"
 	monitoringv1 "github.com/coreos/prometheus-operator/pkg/client/monitoring/v1"
@@ -36,10 +36,17 @@ import (
 )
 
 const (
-	governingServiceName = "prometheus-operated"
-	DefaultVersion       = "v1.7.1"
-	defaultRetention     = "24h"
-	configMapsFilename   = "configmaps.json"
+	governingServiceName   = "prometheus-operated"
+	DefaultVersion         = "v2.2.1"
+	defaultRetention       = "24h"
+	storageDir             = "/prometheus"
+	confDir                = "/etc/prometheus/config"
+	confOutDir             = "/etc/prometheus/config_out"
+	rulesDir               = "/etc/prometheus/config_out/rules"
+	secretsDir             = "/etc/prometheus/secrets/"
+	configFilename         = "prometheus.yaml"
+	configEnvsubstFilename = "prometheus.env.yaml"
+	ruleConfigmapsFilename = "configmaps.json"
 )
 
 var (
@@ -64,11 +71,14 @@ var (
 		"v1.6.3",
 		"v1.7.0",
 		"v1.7.1",
-		"v2.0.0-beta.4",
+		"v1.7.2",
+		"v1.8.0",
+		"v2.0.0",
+		"v2.2.1",
 	}
 )
 
-func makeStatefulSet(p monitoringv1.Prometheus, old *v1beta1.StatefulSet, config *Config, ruleConfigMaps []*v1.ConfigMap) (*v1beta1.StatefulSet, error) {
+func makeStatefulSet(p monitoringv1.Prometheus, old *appsv1.StatefulSet, config *Config, ruleConfigMaps []*v1.ConfigMap) (*appsv1.StatefulSet, error) {
 	// TODO(fabxc): is this the right point to inject defaults?
 	// Ideally we would do it before storing but that's currently not possible.
 	// Potentially an update handler on first insertion.
@@ -79,11 +89,20 @@ func makeStatefulSet(p monitoringv1.Prometheus, old *v1beta1.StatefulSet, config
 	if p.Spec.Version == "" {
 		p.Spec.Version = DefaultVersion
 	}
+
+	versionStr := strings.TrimLeft(p.Spec.Version, "v")
+
+	version, err := semver.Parse(versionStr)
+	if err != nil {
+		return nil, errors.Wrap(err, "parse version")
+	}
+
 	if p.Spec.Replicas == nil {
 		p.Spec.Replicas = &minReplicas
 	}
-	if p.Spec.Replicas != nil && *p.Spec.Replicas < minReplicas {
-		p.Spec.Replicas = &minReplicas
+	intZero := int32(0)
+	if p.Spec.Replicas != nil && *p.Spec.Replicas < 0 {
+		p.Spec.Replicas = &intZero
 	}
 	if p.Spec.Retention == "" {
 		p.Spec.Retention = defaultRetention
@@ -92,8 +111,19 @@ func makeStatefulSet(p monitoringv1.Prometheus, old *v1beta1.StatefulSet, config
 	if p.Spec.Resources.Requests == nil {
 		p.Spec.Resources.Requests = v1.ResourceList{}
 	}
-	if _, ok := p.Spec.Resources.Requests[v1.ResourceMemory]; !ok {
-		p.Spec.Resources.Requests[v1.ResourceMemory] = resource.MustParse("2Gi")
+	_, memoryRequestFound := p.Spec.Resources.Requests[v1.ResourceMemory]
+	memoryLimit, memoryLimitFound := p.Spec.Resources.Limits[v1.ResourceMemory]
+	if !memoryRequestFound && version.Major == 1 {
+		defaultMemoryRequest := resource.MustParse("2Gi")
+		compareResult := memoryLimit.Cmp(defaultMemoryRequest)
+		// If limit is given and smaller or equal to 2Gi, then set memory
+		// request to the given limit. This is necessary as if limit < request,
+		// then a Pod is not schedulable.
+		if memoryLimitFound && compareResult <= 0 {
+			p.Spec.Resources.Requests[v1.ResourceMemory] = memoryLimit
+		} else {
+			p.Spec.Resources.Requests[v1.ResourceMemory] = defaultMemoryRequest
+		}
 	}
 
 	spec, err := makeStatefulSetSpec(p, config, ruleConfigMaps)
@@ -101,11 +131,22 @@ func makeStatefulSet(p monitoringv1.Prometheus, old *v1beta1.StatefulSet, config
 		return nil, errors.Wrap(err, "make StatefulSet spec")
 	}
 
-	statefulset := &v1beta1.StatefulSet{
+	boolTrue := true
+	statefulset := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        prefixedName(p.Name),
-			Labels:      p.ObjectMeta.Labels,
+			Labels:      config.Labels.Merge(p.ObjectMeta.Labels),
 			Annotations: p.ObjectMeta.Annotations,
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion:         p.APIVersion,
+					BlockOwnerDeletion: &boolTrue,
+					Controller:         &boolTrue,
+					Kind:               p.Kind,
+					Name:               p.Name,
+					UID:                p.UID,
+				},
+			},
 		},
 		Spec: *spec,
 	}
@@ -121,6 +162,14 @@ func makeStatefulSet(p monitoringv1.Prometheus, old *v1beta1.StatefulSet, config
 				EmptyDir: &v1.EmptyDirVolumeSource{},
 			},
 		})
+	} else if storageSpec.EmptyDir != nil {
+		emptyDir := storageSpec.EmptyDir
+		statefulset.Spec.Template.Spec.Volumes = append(statefulset.Spec.Template.Spec.Volumes, v1.Volume{
+			Name: volumeName(p.Name),
+			VolumeSource: v1.VolumeSource{
+				EmptyDir: emptyDir,
+			},
+		})
 	} else {
 		pvcTemplate := storageSpec.VolumeClaimTemplate
 		pvcTemplate.Name = volumeName(p.Name)
@@ -132,26 +181,16 @@ func makeStatefulSet(p monitoringv1.Prometheus, old *v1beta1.StatefulSet, config
 
 	if old != nil {
 		statefulset.Annotations = old.Annotations
-	}
 
-	if !config.StatefulSetUpdatesAvailable {
-		statefulset.Spec.UpdateStrategy = v1beta1.StatefulSetUpdateStrategy{}
-
-		if old != nil {
-			// Mounted volumes are not reconciled as StatefulSets do not allow
-			// modification of the PodTemplate.
-			//
-			// TODO(brancz): remove this when dropping 1.6 compatibility.
-			statefulset.Spec.Template.Spec.Containers[0].VolumeMounts = old.Spec.Template.Spec.Containers[0].VolumeMounts
-			statefulset.Spec.Template.Spec.Volumes = old.Spec.Template.Spec.Volumes
-		}
+		// Updates to statefulset spec for fields other than 'replicas', 'template', and 'updateStrategy' are forbidden.
+		statefulset.Spec.PodManagementPolicy = old.Spec.PodManagementPolicy
 	}
 
 	return statefulset, nil
 }
 
-func makeEmptyConfig(name string, configMaps []*v1.ConfigMap) (*v1.Secret, error) {
-	s, err := makeConfigSecret(name, configMaps)
+func makeEmptyConfig(p *monitoringv1.Prometheus, configMaps []*v1.ConfigMap, config Config) (*v1.Secret, error) {
+	s, err := makeConfigSecret(p, configMaps, config)
 	if err != nil {
 		return nil, err
 	}
@@ -222,31 +261,42 @@ func makeRuleConfigMapListFile(configMaps []*v1.ConfigMap) ([]byte, error) {
 	return json.Marshal(cml)
 }
 
-func makeConfigSecret(name string, configMaps []*v1.ConfigMap) (*v1.Secret, error) {
+func makeConfigSecret(p *monitoringv1.Prometheus, configMaps []*v1.ConfigMap, config Config) (*v1.Secret, error) {
 	b, err := makeRuleConfigMapListFile(configMaps)
 	if err != nil {
 		return nil, err
 	}
 
+	boolTrue := true
 	return &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:   configSecretName(name),
-			Labels: managedByOperatorLabels,
+			Name:   configSecretName(p.Name),
+			Labels: config.Labels.Merge(managedByOperatorLabels),
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion:         p.APIVersion,
+					BlockOwnerDeletion: &boolTrue,
+					Controller:         &boolTrue,
+					Kind:               p.Kind,
+					Name:               p.Name,
+					UID:                p.UID,
+				},
+			},
 		},
 		Data: map[string][]byte{
-			configFilename:     []byte{},
-			configMapsFilename: b,
+			configFilename:         []byte{},
+			ruleConfigmapsFilename: b,
 		},
 	}, nil
 }
 
-func makeStatefulSetService(p *monitoringv1.Prometheus) *v1.Service {
+func makeStatefulSetService(p *monitoringv1.Prometheus, config Config) *v1.Service {
 	svc := &v1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: governingServiceName,
-			Labels: map[string]string{
+			Labels: config.Labels.Merge(map[string]string{
 				"operated-prometheus": "true",
-			},
+			}),
 		},
 		Spec: v1.ServiceSpec{
 			ClusterIP: "None",
@@ -265,7 +315,7 @@ func makeStatefulSetService(p *monitoringv1.Prometheus) *v1.Service {
 	return svc
 }
 
-func makeStatefulSetSpec(p monitoringv1.Prometheus, c *Config, ruleConfigMaps []*v1.ConfigMap) (*v1beta1.StatefulSetSpec, error) {
+func makeStatefulSetSpec(p monitoringv1.Prometheus, c *Config, ruleConfigMaps []*v1.ConfigMap) (*appsv1.StatefulSetSpec, error) {
 	// Prometheus may take quite long to shut down to checkpoint existing data.
 	// Allow up to 10 minutes for clean termination.
 	terminationGracePeriod := int64(600)
@@ -278,16 +328,16 @@ func makeStatefulSetSpec(p monitoringv1.Prometheus, c *Config, ruleConfigMaps []
 	}
 
 	var promArgs []string
-	var securityContext v1.PodSecurityContext
+	var securityContext *v1.PodSecurityContext
 
 	switch version.Major {
 	case 1:
 		promArgs = append(promArgs,
 			"-storage.local.retention="+p.Spec.Retention,
 			"-storage.local.num-fingerprint-mutexes=4096",
-			"-storage.local.path=/var/prometheus/data",
+			fmt.Sprintf("-storage.local.path=%s", storageDir),
 			"-storage.local.chunk-encoding-version=2",
-			"-config.file=/etc/prometheus/config/prometheus.yaml",
+			fmt.Sprintf("-config.file=%s", path.Join(confOutDir, configEnvsubstFilename)),
 		)
 		// We attempt to specify decent storage tuning flags based on how much the
 		// requested memory can fit. The user has to specify an appropriate buffering
@@ -314,35 +364,32 @@ func makeStatefulSetSpec(p monitoringv1.Prometheus, c *Config, ruleConfigMaps []
 			)
 		}
 
-		securityContext = v1.PodSecurityContext{}
+		securityContext = &v1.PodSecurityContext{}
 	case 2:
-
-		// Prometheus 2.0 is in alpha and is highly experimental, and therefore
-		// flags and other things may change for the final release of 2.0. This
-		// section is also regarded as experimental until a Prometheus 2.0 stable
-		// has been released. These flags will be updated to work with every new
-		// 2.0 release until a stable release. These flags are taregeted at version
-		// v2.0.0-alpha.3, there is no guarantee that these flags will continue to
-		// work for any further version, this feature is experimental and developed
-		// on a best effort basis.
-
 		promArgs = append(promArgs,
-			"-config.file=/etc/prometheus/config/prometheus.yaml",
-			"-storage.tsdb.path=/var/prometheus/data",
+			fmt.Sprintf("-config.file=%s", path.Join(confOutDir, configEnvsubstFilename)),
+			fmt.Sprintf("-storage.tsdb.path=%s", storageDir),
 			"-storage.tsdb.retention="+p.Spec.Retention,
 			"-web.enable-lifecycle",
+			"-storage.tsdb.no-lockfile",
 		)
 
 		gid := int64(2000)
 		uid := int64(1000)
 		nr := true
-		securityContext = v1.PodSecurityContext{
-			FSGroup:      &gid,
+		securityContext = &v1.PodSecurityContext{
 			RunAsNonRoot: &nr,
-			RunAsUser:    &uid,
+		}
+		if !c.DisableAutoUserGroup {
+			securityContext.FSGroup = &gid
+			securityContext.RunAsUser = &uid
 		}
 	default:
 		return nil, errors.Errorf("unsupported Prometheus major version %s", version)
+	}
+
+	if p.Spec.SecurityContext != nil {
+		securityContext = p.Spec.SecurityContext
 	}
 
 	if p.Spec.ExternalURL != "" {
@@ -354,6 +401,23 @@ func makeStatefulSetSpec(p monitoringv1.Prometheus, c *Config, ruleConfigMaps []
 		webRoutePrefix = p.Spec.RoutePrefix
 	}
 	promArgs = append(promArgs, "-web.route-prefix="+webRoutePrefix)
+
+	if p.Spec.LogLevel != "" && p.Spec.LogLevel != "info" {
+		promArgs = append(promArgs, fmt.Sprintf("-log.level=%s", p.Spec.LogLevel))
+	}
+
+	var ports []v1.ContainerPort
+	if p.Spec.ListenLocal {
+		promArgs = append(promArgs, "-web.listen-address=127.0.0.1:9090")
+	} else {
+		ports = []v1.ContainerPort{
+			{
+				Name:          "web",
+				ContainerPort: 9090,
+				Protocol:      v1.ProtocolTCP,
+			},
+		}
+	}
 
 	if version.Major == 2 {
 		for i, a := range promArgs {
@@ -377,7 +441,7 @@ func makeStatefulSetSpec(p monitoringv1.Prometheus, c *Config, ruleConfigMaps []
 			},
 		},
 		{
-			Name: "rules",
+			Name: "config-out",
 			VolumeSource: v1.VolumeSource{
 				EmptyDir: &v1.EmptyDirVolumeSource{},
 			},
@@ -386,18 +450,13 @@ func makeStatefulSetSpec(p monitoringv1.Prometheus, c *Config, ruleConfigMaps []
 
 	promVolumeMounts := []v1.VolumeMount{
 		{
-			Name:      "config",
+			Name:      "config-out",
 			ReadOnly:  true,
-			MountPath: "/etc/prometheus/config",
-		},
-		{
-			Name:      "rules",
-			ReadOnly:  true,
-			MountPath: "/etc/prometheus/rules",
+			MountPath: confOutDir,
 		},
 		{
 			Name:      volumeName(p.Name),
-			MountPath: "/var/prometheus/data",
+			MountPath: storageDir,
 			SubPath:   subPathForStorage(p.Spec.Storage),
 		},
 	}
@@ -414,34 +473,76 @@ func makeStatefulSetSpec(p monitoringv1.Prometheus, c *Config, ruleConfigMaps []
 		promVolumeMounts = append(promVolumeMounts, v1.VolumeMount{
 			Name:      "secret-" + s,
 			ReadOnly:  true,
-			MountPath: "/etc/prometheus/secrets/" + s,
+			MountPath: secretsDir + s,
 		})
 	}
 
 	configReloadVolumeMounts := []v1.VolumeMount{
 		{
 			Name:      "config",
-			ReadOnly:  true,
-			MountPath: "/etc/prometheus/config",
+			MountPath: confDir,
 		},
 		{
-			Name:      "rules",
-			MountPath: "/etc/prometheus/rules",
+			Name:      "config-out",
+			MountPath: confOutDir,
 		},
 	}
 
 	configReloadArgs := []string{
-		fmt.Sprintf("-reload-url=%s", localReloadURL),
-		"-config-volume-dir=/etc/prometheus/config",
-		"-rule-volume-dir=/etc/prometheus/rules",
+		fmt.Sprintf("--reload-url=%s", localReloadURL),
+		fmt.Sprintf("--config-file=%s", path.Join(confDir, configFilename)),
+		fmt.Sprintf("--rule-list-file=%s", path.Join(confDir, ruleConfigmapsFilename)),
+		fmt.Sprintf("--config-envsubst-file=%s", path.Join(confOutDir, configEnvsubstFilename)),
+		fmt.Sprintf("--rule-dir=%s", rulesDir),
 	}
 
-	probeHandler := v1.Handler{
-		HTTPGet: &v1.HTTPGetAction{
-			Path: path.Clean(webRoutePrefix + "/status"),
-			Port: intstr.FromString("web"),
-		},
+	var livenessProbeHandler v1.Handler
+	var readinessProbeHandler v1.Handler
+	var livenessFailureThreshold int32
+	if (version.Major == 1 && version.Minor >= 8) || version.Major == 2 {
+		livenessProbeHandler = v1.Handler{
+			HTTPGet: &v1.HTTPGetAction{
+				Path: path.Clean(webRoutePrefix + "/-/healthy"),
+				Port: intstr.FromString("web"),
+			},
+		}
+		readinessProbeHandler = v1.Handler{
+			HTTPGet: &v1.HTTPGetAction{
+				Path: path.Clean(webRoutePrefix + "/-/ready"),
+				Port: intstr.FromString("web"),
+			},
+		}
+		livenessFailureThreshold = 6
+	} else {
+		livenessProbeHandler = v1.Handler{
+			HTTPGet: &v1.HTTPGetAction{
+				Path: path.Clean(webRoutePrefix + "/status"),
+				Port: intstr.FromString("web"),
+			},
+		}
+		readinessProbeHandler = livenessProbeHandler
+		// For larger servers, restoring a checkpoint on startup may take quite a bit of time.
+		// Wait up to 5 minutes (60 fails * 5s per fail)
+		livenessFailureThreshold = 60
 	}
+
+	var livenessProbe *v1.Probe
+	var readinessProbe *v1.Probe
+	if !p.Spec.ListenLocal {
+		livenessProbe = &v1.Probe{
+			Handler:          livenessProbeHandler,
+			PeriodSeconds:    5,
+			TimeoutSeconds:   probeTimeoutSeconds,
+			FailureThreshold: livenessFailureThreshold,
+		}
+		readinessProbe = &v1.Probe{
+			Handler:          readinessProbeHandler,
+			TimeoutSeconds:   probeTimeoutSeconds,
+			PeriodSeconds:    5,
+			FailureThreshold: 120, // Allow up to 10m on startup for data recovery
+		}
+	}
+
 	podAnnotations := map[string]string{}
 	podLabels := map[string]string{}
 	if p.Spec.PodMetadata != nil {
@@ -456,52 +557,49 @@ func makeStatefulSetSpec(p monitoringv1.Prometheus, c *Config, ruleConfigMaps []
 			}
 		}
 	}
+
 	podLabels["app"] = "prometheus"
 	podLabels["prometheus"] = p.Name
-	return &v1beta1.StatefulSetSpec{
-		ServiceName: governingServiceName,
-		Replicas:    p.Spec.Replicas,
-		UpdateStrategy: v1beta1.StatefulSetUpdateStrategy{
-			Type: v1beta1.RollingUpdateStatefulSetStrategyType,
+
+	finalLabels := c.Labels.Merge(podLabels)
+
+	return &appsv1.StatefulSetSpec{
+		ServiceName:         governingServiceName,
+		Replicas:            p.Spec.Replicas,
+		PodManagementPolicy: appsv1.ParallelPodManagement,
+		UpdateStrategy: appsv1.StatefulSetUpdateStrategy{
+			Type: appsv1.RollingUpdateStatefulSetStrategyType,
+		},
+		Selector: &metav1.LabelSelector{
+			MatchLabels: finalLabels,
 		},
 		Template: v1.PodTemplateSpec{
 			ObjectMeta: metav1.ObjectMeta{
-				Labels:      podLabels,
+				Labels:      finalLabels,
 				Annotations: podAnnotations,
 			},
 			Spec: v1.PodSpec{
-				Containers: []v1.Container{
+				Containers: append([]v1.Container{
 					{
-						Name:  "prometheus",
-						Image: fmt.Sprintf("%s:%s", p.Spec.BaseImage, p.Spec.Version),
-						Ports: []v1.ContainerPort{
+						Name:           "prometheus",
+						Image:          fmt.Sprintf("%s:%s", p.Spec.BaseImage, p.Spec.Version),
+						Ports:          ports,
+						Args:           promArgs,
+						VolumeMounts:   promVolumeMounts,
+						LivenessProbe:  livenessProbe,
+						ReadinessProbe: readinessProbe,
+						Resources:      p.Spec.Resources,
+					}, {
+						Name:  "prometheus-config-reloader",
+						Image: c.PrometheusConfigReloader,
+						Env: []v1.EnvVar{
 							{
-								Name:          "web",
-								ContainerPort: 9090,
-								Protocol:      v1.ProtocolTCP,
+								Name: "POD_NAME",
+								ValueFrom: &v1.EnvVarSource{
+									FieldRef: &v1.ObjectFieldSelector{FieldPath: "metadata.name"},
+								},
 							},
 						},
-						Args:         promArgs,
-						VolumeMounts: promVolumeMounts,
-						LivenessProbe: &v1.Probe{
-							Handler: probeHandler,
-							// For larger servers, restoring a checkpoint on startup may take quite a bit of time.
-							// Wait up to 5 minutes.
-							InitialDelaySeconds: 300,
-							PeriodSeconds:       5,
-							TimeoutSeconds:      probeTimeoutSeconds,
-							FailureThreshold:    10,
-						},
-						ReadinessProbe: &v1.Probe{
-							Handler:          probeHandler,
-							TimeoutSeconds:   probeTimeoutSeconds,
-							PeriodSeconds:    5,
-							FailureThreshold: 6,
-						},
-						Resources: p.Spec.Resources,
-					}, {
-						Name:         "prometheus-config-reloader",
-						Image:        c.PrometheusConfigReloader,
 						Args:         configReloadArgs,
 						VolumeMounts: configReloadVolumeMounts,
 						Resources: v1.ResourceRequirements{
@@ -511,8 +609,8 @@ func makeStatefulSetSpec(p monitoringv1.Prometheus, c *Config, ruleConfigMaps []
 							},
 						},
 					},
-				},
-				SecurityContext:               &securityContext,
+				}, p.Spec.Containers...),
+				SecurityContext:               securityContext,
 				ServiceAccountName:            p.Spec.ServiceAccountName,
 				NodeSelector:                  p.Spec.NodeSelector,
 				TerminationGracePeriodSeconds: &terminationGracePeriod,

@@ -11,6 +11,8 @@ The Prometheus Operator supports a number of Kubernetes and Prometheus releases.
 
 The Prometheus Operator uses client-go to communicate with Kubernetes clusters. The supported Kubernetes cluster version is determined by client-go. The compatibility matrix for client-go and Kubernetes clusters can be found [here](https://github.com/kubernetes/client-go#compatibility-matrix). All additional compatibility is only best effort, or happens to still/already be supported. The currently used client-go version is "v4.0.0-beta.0".
 
+Due to the use of CustomResourceDefinitions Kubernetes >= v1.7.0 is required.
+
 ## Prometheus
 
 The versions of Prometheus compatible to be run with the Prometheus Operator are:
@@ -27,4 +29,7 @@ The versions of Prometheus compatible to be run with the Prometheus Operator are
 * v1.6.3
 * v1.7.0
 * v1.7.1
-* v2.0.0-beta.4
+* v1.7.2
+* v1.8.0
+* v2.0.0
+* v2.2.1
